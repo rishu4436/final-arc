@@ -1,5 +1,6 @@
 "use client";
 
+import { BrandMark } from "@/components/BrandMark";
 import { ConnectButton } from "@/components/ConnectButton";
 import { Lookup } from "@/components/Lookup";
 import { motion, useScroll, useTransform } from "framer-motion";
@@ -54,8 +55,8 @@ export function Landing() {
         style={{ backgroundColor: headerBg }}
       >
         <div className="mx-auto flex max-w-5xl items-center justify-between gap-4 px-5 py-4">
-          <Link href="/" className="display text-xl tracking-tight no-underline">
-            Final
+          <Link href="/" className="no-underline">
+            <BrandMark />
           </Link>
           <div className="flex items-center gap-5">
             <a href="#send" className="hidden text-sm text-[var(--muted)] no-underline sm:inline">

@@ -20,10 +20,14 @@ const mono = IBM_Plex_Mono({
 });
 
 export const metadata: Metadata = {
-  metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000"),
+  metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL ?? "https://final-arc-eight.vercel.app"),
   title: "Final — USDC receipts on Arc",
   description:
     "Send USDC on Arc through the protocol Memo contract. Open a public receipt that is final at inclusion.",
+  icons: {
+    icon: [{ url: "/logo.svg", type: "image/svg+xml" }, { url: "/favicon-32.png", sizes: "32x32" }],
+    apple: "/icon-192.png",
+  },
 };
 
 export default function RootLayout({

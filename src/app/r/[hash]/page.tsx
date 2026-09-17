@@ -1,3 +1,4 @@
+import { BrandMark } from "@/components/BrandMark";
 import { ConnectButton } from "@/components/ConnectButton";
 import { loadReceipt } from "@/lib/loadReceipt";
 import { formatUsdc } from "@/lib/format";
@@ -38,8 +39,8 @@ export default async function ReceiptPage({ params }: Props) {
   return (
     <div className="min-h-screen">
       <header className="mx-auto flex max-w-5xl items-center justify-between gap-4 px-5 py-5">
-        <Link href="/" className="display text-xl tracking-tight no-underline">
-          Final
+        <Link href="/" className="no-underline">
+          <BrandMark />
         </Link>
         <ConnectButton />
       </header>
