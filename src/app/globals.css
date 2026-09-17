@@ -1,0 +1,84 @@
+@import "tailwindcss";
+
+:root {
+  --paper: #efe8da;
+  --sheet: #fbf6ec;
+  --ink: #161310;
+  --muted: #6e675d;
+  --line: #d4cbbd;
+  --stamp: #b42318;
+  --ok: #1f6b3a;
+}
+
+html,
+body {
+  background: var(--paper);
+  color: var(--ink);
+}
+
+body {
+  font-family: var(--font-body), Georgia, "Times New Roman", serif;
+  background-image:
+    radial-gradient(ellipse 80% 50% at 10% -10%, rgba(180, 35, 24, 0.05), transparent 50%),
+    repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 27px,
+      rgba(22, 19, 16, 0.035) 28px
+    );
+  background-attachment: fixed;
+}
+
+.mono {
+  font-family: var(--font-mono), ui-monospace, monospace;
+}
+
+.display {
+  font-family: var(--font-display), Georgia, serif;
+}
+
+.perforation {
+  background-image: radial-gradient(circle, var(--line) 1.15px, transparent 1.35px);
+  background-size: 11px 11px;
+  background-repeat: repeat-x;
+  background-position: center;
+  height: 12px;
+}
+
+.stamp {
+  color: var(--stamp);
+  border: 2px solid var(--stamp);
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  rotate: -8deg;
+}
+
+.receipt-sheet {
+  background: var(--sheet);
+  border: 1px solid var(--line);
+}
+
+.hairline {
+  height: 1px;
+  background: var(--line);
+}
+
+footer a:hover,
+header a:hover {
+  color: var(--stamp);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+html {
+  scroll-behavior: smooth;
+}
