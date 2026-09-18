@@ -19,7 +19,7 @@ function uniqueConnectors(connectors: readonly Connector[]): Connector[] {
   return list;
 }
 
-export function ConnectButton() {
+export function ConnectButton({ preferArc = true }: { preferArc?: boolean }) {
   const { address, isConnected, chainId } = useAccount();
   const { connectors, connectAsync, isPending } = useConnect();
   const { disconnect } = useDisconnect();
@@ -27,7 +27,7 @@ export function ConnectButton() {
   const [error, setError] = useState<string | null>(null);
   const [picking, setPicking] = useState(false);
   const mounted = useMounted();
-  const wrongChain = isConnected && chainId !== ARC_CHAIN_ID;
+  const wrongChain = preferArc && isConnected && chainId !== ARC_CHAIN_ID;
   const ready = mounted && isConnected && Boolean(address);
 
   const wallets = useMemo(() => uniqueConnectors(connectors), [connectors]);
@@ -44,6 +44,7 @@ export function ConnectButton() {
     setPicking(false);
     try {
       await connectAsync({ connector });
+      if (!preferArc) return;
       try {
         await switchToArc();
       } catch (switchErr) {

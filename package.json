@@ -7,9 +7,11 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "tsx --test src/lib/format.test.ts src/lib/receipt.test.ts src/lib/gas.test.ts src/lib/payRequest.test.ts"
+    "test": "tsx --test src/lib/format.test.ts src/lib/receipt.test.ts src/lib/gas.test.ts src/lib/payRequest.test.ts src/lib/cctp.test.ts"
   },
   "dependencies": {
+    "@circle-fin/adapter-viem-v2": "^1.18.0",
+    "@circle-fin/bridge-kit": "^1.15.1",
     "@tanstack/react-query": "^5.90.2",
     "framer-motion": "^13.4.0",
     "next": "^15.5.4",

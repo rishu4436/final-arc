@@ -148,8 +148,9 @@ export function Landing() {
           <p className="text-[11px] uppercase tracking-[0.28em] text-[var(--muted)]">Desk</p>
           <h2 className="display mt-3 text-4xl leading-none">Desk</h2>
           <p className="mt-4 max-w-sm text-[var(--muted)]">
-            Send USDC, or create a payment link. The statement is the Memo
-            ledger for this address, read from Arc.
+            Send USDC, or create a payment link. Payers can settle from Arc or
+            bridge USDC from Base, Ethereum, and other CCTP chains, then Memo
+            on Arc.
           </p>
         </Reveal>
         <Reveal delay={0.12}>

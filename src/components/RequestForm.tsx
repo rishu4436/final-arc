@@ -15,6 +15,7 @@ export function RequestForm() {
   const [link, setLink] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [webhookUrl, setWebhookUrl] = useState("");
 
   function onSubmit(event: React.FormEvent) {
     event.preventDefault();
@@ -33,7 +34,11 @@ export function RequestForm() {
       void fetch("/api/pay", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ token, action: "register" }),
+        body: JSON.stringify({
+          token,
+          action: "register",
+          webhookUrl: webhookUrl.trim() || undefined,
+        }),
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not create the link.");
@@ -81,6 +86,19 @@ export function RequestForm() {
           onChange={(e) => setMemo(e.target.value)}
           placeholder="INV-1042"
           className="w-full border-0 border-b border-[var(--line)] bg-transparent py-2 outline-none focus:border-[var(--ink)]"
+        />
+      </label>
+
+      <label className="block">
+        <span className="mb-1 block text-xs uppercase tracking-[0.16em] text-[var(--muted)]">
+          Webhook (optional)
+        </span>
+        <input
+          type="url"
+          value={webhookUrl}
+          onChange={(e) => setWebhookUrl(e.target.value)}
+          placeholder="https://…"
+          className="mono w-full border-0 border-b border-[var(--line)] bg-transparent py-2 outline-none focus:border-[var(--ink)]"
         />
       </label>
 

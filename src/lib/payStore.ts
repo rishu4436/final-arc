@@ -14,6 +14,7 @@ export type PayRecord = {
   cancelled: boolean;
   cancelledAt: string | null;
   paidTx: Hash | null;
+  webhookUrl: string | null;
 };
 
 type StoreFile = { records: Record<string, PayRecord> };
@@ -97,6 +98,7 @@ export async function upsertRecord(record: PayRecord): Promise<PayRecord> {
         to: record.to,
         id: record.id,
         paidTx: existing.paidTx ?? record.paidTx,
+        webhookUrl: record.webhookUrl ?? existing.webhookUrl,
       }
     : record;
   await writeStore(store);

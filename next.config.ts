@@ -1,6 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  transpilePackages: ["@circle-fin/bridge-kit", "@circle-fin/adapter-viem-v2"],
   webpack: (config) => {
     config.resolve.alias = {
       ...config.resolve.alias,

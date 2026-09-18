@@ -1,6 +1,6 @@
 "use client";
 
-import { SendForm } from "@/components/SendForm";
+import { CrossChainPay } from "@/components/CrossChainPay";
 import { explorerAddress, explorerTx, formatUsdc, shortAddr } from "@/lib/format";
 import type { PayRequest } from "@/lib/payRequest";
 import type { PayRecord } from "@/lib/payStore";
@@ -87,7 +87,7 @@ export function PaySheet({ token, req }: { token: string; req: PayRequest }) {
         ) : cancelled ? (
           <p className="text-sm text-[var(--stamp)]">This payment link has been cancelled.</p>
         ) : (
-          <SendForm hideBalance locked={req} />
+          <CrossChainPay to={req.to} amount={req.amount} memo={req.memo} />
         )}
       </div>
     </article>

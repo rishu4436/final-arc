@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getAddress, isAddress, type Address } from "viem";
 import { decodePayRequest } from "@/lib/payRequest";
 import { findPaidTx } from "@/lib/payPaid";
+import { notifyWebhook } from "@/lib/notify";
 import {
   getRecord,
   listByPayee,
@@ -23,7 +24,9 @@ async function withPaid(row: PayRecord): Promise<PayRecord> {
     const tx = await findPaidTx({ to: row.to, amount: row.amount, memo: row.memo });
     if (tx) {
       const updated = await markPaid(row.token, tx);
-      return updated ?? { ...row, paidTx: tx };
+      const next = updated ?? { ...row, paidTx: tx };
+      void notifyWebhook(next, "paid");
+      return next;
     }
   } catch {
     /* RPC lookup is best-effort */
@@ -53,6 +56,7 @@ export async function GET(request: Request) {
         cancelled: false,
         cancelledAt: null,
         paidTx: null,
+        webhookUrl: null,
       });
     }
     row = await withPaid(row);
@@ -73,6 +77,7 @@ export async function POST(request: Request) {
     token?: string;
     action?: "register" | "view" | "cancel";
     address?: string;
+    webhookUrl?: string;
   };
   const token = tokenFrom(body);
   if (!token) return NextResponse.json({ error: "token required" }, { status: 400 });
@@ -82,6 +87,10 @@ export async function POST(request: Request) {
   const action = body.action ?? "register";
 
   if (action === "register") {
+    const webhookUrl =
+      typeof body.webhookUrl === "string" && /^https:\/\//i.test(body.webhookUrl)
+        ? body.webhookUrl
+        : null;
     const row = await upsertRecord({
       token,
       id: req.id,
@@ -94,6 +103,7 @@ export async function POST(request: Request) {
       cancelled: false,
       cancelledAt: null,
       paidTx: null,
+      webhookUrl,
     });
     return NextResponse.json({ record: await withPaid(row) });
   }
@@ -113,10 +123,13 @@ export async function POST(request: Request) {
         cancelled: false,
         cancelledAt: null,
         paidTx: null,
+        webhookUrl: null,
       });
     }
     row = (await markViewed(token)) ?? row;
-    return NextResponse.json({ record: await withPaid(row) });
+    const next = await withPaid(row);
+    if (!next.paidTx) void notifyWebhook(next, "viewed");
+    return NextResponse.json({ record: next });
   }
 
   if (action === "cancel") {
@@ -127,7 +140,9 @@ export async function POST(request: Request) {
     if (!row) {
       return NextResponse.json({ error: "Only the payee can cancel this link." }, { status: 403 });
     }
-    return NextResponse.json({ record: await withPaid(row) });
+    const next = await withPaid(row);
+    void notifyWebhook(next, "cancelled");
+    return NextResponse.json({ record: next });
   }
 
   return NextResponse.json({ error: "Unknown action" }, { status: 400 });

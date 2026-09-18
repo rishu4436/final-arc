@@ -34,7 +34,7 @@ export default async function PayPage({ params }: Props) {
         <Link href="/" className="no-underline">
           <BrandMark />
         </Link>
-        <ConnectButton />
+        <ConnectButton preferArc={false} />
       </header>
       <main className="mx-auto max-w-xl px-5 pb-16 pt-4">
         {!req ? (
