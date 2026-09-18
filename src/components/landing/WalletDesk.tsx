@@ -1,8 +1,8 @@
 "use client";
 
-import { HistoryList } from "@/components/HistoryList";
 import { RequestForm } from "@/components/RequestForm";
 import { SendForm } from "@/components/SendForm";
+import { Statement } from "@/components/Statement";
 import { ARC_CHAIN_ID, USDC_ADDRESS, USDC_DECIMALS } from "@/lib/arc";
 import { formatUsdc } from "@/lib/format";
 import { useMounted } from "@/hooks/useMounted";
@@ -18,7 +18,7 @@ export function WalletDesk() {
   const connected = mounted && isConnected && Boolean(address);
   const onArc = chainId === ARC_CHAIN_ID;
   const animate = useMotionSafe();
-  const [tab, setTab] = useState<"send" | "request" | "history">("send");
+  const [tab, setTab] = useState<"send" | "request" | "statement">("send");
 
   const { data: tokenBalance } = useReadContract({
     address: USDC_ADDRESS,
@@ -58,8 +58,8 @@ export function WalletDesk() {
         <TabButton active={tab === "request"} onClick={() => setTab("request")}>
           Request
         </TabButton>
-        <TabButton active={tab === "history"} onClick={() => setTab("history")}>
-          History
+        <TabButton active={tab === "statement"} onClick={() => setTab("statement")}>
+          Statement
         </TabButton>
       </div>
       <div className="p-6 sm:p-8">
@@ -68,7 +68,7 @@ export function WalletDesk() {
         ) : tab === "request" ? (
           <RequestForm />
         ) : (
-          <HistoryList />
+          <Statement />
         )}
       </div>
     </div>

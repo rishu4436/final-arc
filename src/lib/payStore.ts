@@ -18,12 +18,53 @@ export type PayRecord = {
 
 type StoreFile = { records: Record<string, PayRecord> };
 
+const KV_KEY = "final-pay-store";
+
+function kvCreds(): { url: string; token: string } | null {
+  const url = process.env.KV_REST_API_URL ?? process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.KV_REST_API_TOKEN ?? process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return null;
+  return { url: url.replace(/\/$/, ""), token };
+}
+
 function storePath(): string {
-  if (process.env.VERCEL) return join("/tmp", "final-pay-store.json");
   return join(process.cwd(), "data", "pay-store.json");
 }
 
+async function readKv(creds: { url: string; token: string }): Promise<StoreFile | null> {
+  const res = await fetch(`${creds.url}/get/${KV_KEY}`, {
+    headers: { Authorization: `Bearer ${creds.token}` },
+    cache: "no-store",
+  });
+  if (!res.ok) return null;
+  const body = (await res.json()) as { result?: string | null };
+  if (!body.result) return { records: {} };
+  try {
+    const parsed = JSON.parse(body.result) as StoreFile;
+    return parsed.records ? parsed : { records: {} };
+  } catch {
+    return { records: {} };
+  }
+}
+
+async function writeKv(creds: { url: string; token: string }, store: StoreFile): Promise<void> {
+  const value = JSON.stringify(store);
+  await fetch(`${creds.url}/set/${KV_KEY}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${creds.token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(value),
+  });
+}
+
 async function readStore(): Promise<StoreFile> {
+  const kv = kvCreds();
+  if (kv) {
+    const fromKv = await readKv(kv);
+    if (fromKv) return fromKv;
+  }
   try {
     const raw = await readFile(storePath(), "utf8");
     const parsed = JSON.parse(raw) as StoreFile;
@@ -35,6 +76,11 @@ async function readStore(): Promise<StoreFile> {
 }
 
 async function writeStore(store: StoreFile): Promise<void> {
+  const kv = kvCreds();
+  if (kv) {
+    await writeKv(kv, store);
+    return;
+  }
   const path = storePath();
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, JSON.stringify(store), "utf8");

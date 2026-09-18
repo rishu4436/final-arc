@@ -20,6 +20,8 @@ npm run dev
 
 Chain ID `5042`. USDC on Arc is required to send.
 
+The statement reads Memo transfers from Arc. Link views and cancels persist in `data/pay-store.json` locally, or in Redis when `KV_REST_API_URL` and `KV_REST_API_TOKEN` are set (Vercel KV / Upstash).
+
 | | |
 |---|---|
 | Memo | `0x5294E9927c3306DcBaDb03fe70b92e01cCede505` |
