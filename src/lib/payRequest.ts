@@ -6,6 +6,7 @@ export type PayRequest = {
   to: Address;
   amount: string;
   memo: string;
+  id: string;
 };
 
 function toBase64Url(bytes: Uint8Array): string {
@@ -23,13 +24,25 @@ function fromBase64Url(token: string): Uint8Array {
   return out;
 }
 
+function newId(): string {
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 export function encodePayRequest(input: {
   to: string;
   amount: string;
   memo: string;
 }): string {
   const req = parsePayFields(input);
-  const json = JSON.stringify({ v: 1, to: req.to, amount: req.amount, memo: req.memo });
+  const json = JSON.stringify({
+    v: 1,
+    to: req.to,
+    amount: req.amount,
+    memo: req.memo,
+    id: newId(),
+  });
   return toBase64Url(new TextEncoder().encode(json));
 }
 
@@ -38,11 +51,12 @@ export function decodePayRequest(token: string): PayRequest | null {
     const json = new TextDecoder().decode(fromBase64Url(token));
     const raw = JSON.parse(json) as Partial<PayRequest>;
     if (raw.v !== 1) return null;
-    return parsePayFields({
+    const fields = parsePayFields({
       to: String(raw.to ?? ""),
       amount: String(raw.amount ?? ""),
       memo: String(raw.memo ?? ""),
     });
+    return { ...fields, id: typeof raw.id === "string" && raw.id ? raw.id : "legacy" };
   } catch {
     return null;
   }
@@ -62,5 +76,5 @@ export function parsePayFields(input: {
   const amount = input.amount.trim();
   const amount6 = parseUnits(amount, USDC_DECIMALS);
   if (amount6 <= 0n) throw new Error("Amount must be greater than zero.");
-  return { v: 1, to: getAddress(input.to), amount, memo };
+  return { v: 1, to: getAddress(input.to), amount, memo, id: "legacy" };
 }

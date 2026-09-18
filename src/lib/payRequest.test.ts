@@ -14,6 +14,7 @@ test("encode and decode a payment request", () => {
   assert.equal(decoded.amount, "0.10");
   assert.equal(decoded.memo, "INV-1042");
   assert.equal(decoded.to.toLowerCase(), "0x1111111111111111111111111111111111111111");
+  assert.equal(decoded.id.length, 16);
 });
 
 test("rejects a truncated token", () => {

@@ -1,5 +1,6 @@
 "use client";
 
+import { rememberLink } from "@/lib/payLinksLocal";
 import { encodePayRequest, parsePayFields } from "@/lib/payRequest";
 import { useMounted } from "@/hooks/useMounted";
 import { useState } from "react";
@@ -28,6 +29,12 @@ export function RequestForm() {
       const token = encodePayRequest({ to: address, amount, memo });
       const url = `${window.location.origin}/p/${token}`;
       setLink(url);
+      rememberLink(address, token);
+      void fetch("/api/pay", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token, action: "register" }),
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not create the link.");
       setLink(null);

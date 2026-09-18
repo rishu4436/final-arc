@@ -5,5 +5,6 @@ out
 .vercel
 *.log
 tsconfig.tsbuildinfo
+data/pay-store.json
 
 .vercel

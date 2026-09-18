@@ -148,8 +148,8 @@ export function Landing() {
           <p className="text-[11px] uppercase tracking-[0.28em] text-[var(--muted)]">Desk</p>
           <h2 className="display mt-3 text-4xl leading-none">Desk</h2>
           <p className="mt-4 max-w-sm text-[var(--muted)]">
-            Send USDC, or create a payment link. The payer signs the same Memo
-            transfer and opens the same receipt.
+            Send USDC, or create a payment link. History shows whether a link
+            was viewed, paid, or cancelled.
           </p>
         </Reveal>
         <Reveal delay={0.12}>
