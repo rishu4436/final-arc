@@ -5,3 +5,5 @@ out
 .vercel
 *.log
 tsconfig.tsbuildinfo
+
+.vercel

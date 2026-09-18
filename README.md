@@ -2,6 +2,8 @@
 
 USDC payments on Arc with a protocol memo and a public receipt. Amount is a single USDC figure. Inclusion is final; the receipt matches `arc_getCertificate` to the block.
 
+Create a payment link from the desk. The payer opens `/p/…`, signs the same Memo transfer, and lands on `/r/<tx>`.
+
 ## Arc
 
 - USDC is gas. Native (18 decimals) and ERC-20 (6 decimals) share one balance. Sends reserve gas before transfer.

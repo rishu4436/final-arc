@@ -24,7 +24,7 @@ const steps = [
   {
     n: "03",
     title: "Share the page",
-    body: "/r/0x… is public. Amount is one USDC figure. The certificate is the validators who committed that block.",
+    body: "Share a payment link, or send yourself. Either way the payer lands on a public receipt at /r/0x…",
   },
 ];
 
@@ -146,11 +146,10 @@ export function Landing() {
       <section id="send" className="mx-auto grid max-w-5xl scroll-mt-20 gap-10 px-5 pb-16 md:grid-cols-[0.9fr_1.1fr]">
         <Reveal>
           <p className="text-[11px] uppercase tracking-[0.28em] text-[var(--muted)]">Desk</p>
-          <h2 className="display mt-3 text-4xl leading-none">Send on Arc</h2>
+          <h2 className="display mt-3 text-4xl leading-none">Desk</h2>
           <p className="mt-4 max-w-sm text-[var(--muted)]">
-            Connect a wallet on Arc. USDC is both the payment and the fee.
-            Transfers settle in under a second, with the memo written on the
-            protocol.
+            Send USDC, or create a payment link. The payer signs the same Memo
+            transfer and opens the same receipt.
           </p>
         </Reveal>
         <Reveal delay={0.12}>

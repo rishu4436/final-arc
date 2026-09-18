@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "tsx --test src/lib/format.test.ts src/lib/receipt.test.ts src/lib/gas.test.ts"
+    "test": "tsx --test src/lib/format.test.ts src/lib/receipt.test.ts src/lib/gas.test.ts src/lib/payRequest.test.ts"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.90.2",

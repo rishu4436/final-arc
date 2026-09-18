@@ -1,10 +1,12 @@
 "use client";
 
+import { RequestForm } from "@/components/RequestForm";
+import { SendForm } from "@/components/SendForm";
 import { ARC_CHAIN_ID, USDC_ADDRESS, USDC_DECIMALS } from "@/lib/arc";
 import { formatUsdc } from "@/lib/format";
 import { useMounted } from "@/hooks/useMounted";
-import { SendForm } from "@/components/SendForm";
 import { motion } from "framer-motion";
+import { useState } from "react";
 import { erc20Abi, formatUnits } from "viem";
 import { useAccount, useBytecode, useReadContract } from "wagmi";
 import { easeOut, useMotionSafe } from "./motion";
@@ -15,6 +17,7 @@ export function WalletDesk() {
   const connected = mounted && isConnected && Boolean(address);
   const onArc = chainId === ARC_CHAIN_ID;
   const animate = useMotionSafe();
+  const [tab, setTab] = useState<"send" | "request">("send");
 
   const { data: tokenBalance } = useReadContract({
     address: USDC_ADDRESS,
@@ -31,8 +34,7 @@ export function WalletDesk() {
 
   const balance =
     tokenBalance != null ? formatUsdc(formatUnits(tokenBalance, USDC_DECIMALS)) : "—";
-  const signer =
-    bytecode && bytecode !== "0x" ? "Contract" : "EOA";
+  const signer = bytecode && bytecode !== "0x" ? "Contract" : "EOA";
 
   return (
     <div className="receipt-sheet overflow-hidden">
@@ -48,10 +50,42 @@ export function WalletDesk() {
           <Stat label="Signer" value={signer} warn={signer === "Contract"} />
         </motion.div>
       ) : null}
+      <div className="flex gap-6 border-b border-[var(--line)] px-6 pt-4 sm:px-8">
+        <TabButton active={tab === "send"} onClick={() => setTab("send")}>
+          Send
+        </TabButton>
+        <TabButton active={tab === "request"} onClick={() => setTab("request")}>
+          Request
+        </TabButton>
+      </div>
       <div className="p-6 sm:p-8">
-        <SendForm hideBalance={connected} />
+        {tab === "send" ? <SendForm hideBalance={connected} /> : <RequestForm />}
       </div>
     </div>
+  );
+}
+
+function TabButton({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`border-b-2 pb-2 text-sm ${
+        active
+          ? "border-[var(--ink)] text-[var(--ink)]"
+          : "border-transparent text-[var(--muted)]"
+      }`}
+    >
+      {children}
+    </button>
   );
 }
 
