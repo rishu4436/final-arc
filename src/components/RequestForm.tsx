@@ -27,7 +27,6 @@ export function RequestForm() {
   const { address, isConnected } = useAccount();
   const { signTypedDataAsync } = useSignTypedData();
   const connected = mounted && isConnected && Boolean(address);
-  const [recipient, setRecipient] = useState("");
   const [amount, setAmount] = useState("");
   const [memo, setMemo] = useState("");
   const [hours, setHours] = useState("24");
@@ -51,7 +50,7 @@ export function RequestForm() {
       const nowSeconds = Math.floor(Date.now() / 1000);
       const unsigned = createUnsignedFinalRequest({
         merchant: address,
-        recipient,
+        recipient: address,
         amount,
         memo,
         expiresAt: expiresAtFromHours(hours, nowSeconds),
@@ -100,7 +99,7 @@ export function RequestForm() {
     <form onSubmit={onSubmit} className="flex flex-col gap-5">
       <p className="text-sm text-[var(--muted)]">
         {connected
-          ? "You are the merchant. Sign a V2 request. The payer sends USDC on Arc to the recipient. Signing does not move funds."
+          ? "You are the merchant. Sign a V2 request. The payer sends USDC on Arc to your wallet. Signing does not move funds."
           : "Connect the merchant wallet to sign a V2 Arc USDC payment request."}
       </p>
 
@@ -108,13 +107,9 @@ export function RequestForm() {
         <span className="mb-1 block text-xs uppercase tracking-[0.16em] text-[var(--muted)]">
           Recipient
         </span>
-        <input
-          required
-          value={recipient}
-          onChange={(e) => setRecipient(e.target.value)}
-          placeholder="0x…"
-          className="mono w-full border-0 border-b border-[var(--line)] bg-transparent py-2 outline-none focus:border-[var(--ink)]"
-        />
+        <p className="mono w-full border-0 border-b border-[var(--line)] bg-transparent py-2">
+          {connected && address ? address : "Connect the merchant wallet"}
+        </p>
       </label>
 
       <label className="block">

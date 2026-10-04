@@ -76,6 +76,8 @@ test("a new request defaults to V2", () => {
   const request = unsigned();
   assert.equal(request.version, 2);
   assert.equal(request.chainId, ARC_CHAIN_ID);
+  assert.equal(request.merchant, merchant.address);
+  assert.equal(request.recipient, merchant.address);
 });
 
 test("requestId is 16 bytes and nonce is 32 bytes", () => {
@@ -116,6 +118,7 @@ test("a valid wallet signature seals a V2 link for that merchant", async () => {
     nowSeconds: EXPIRES_AT - 1,
   });
   assert.equal(sealed.request.merchant, merchant.address);
+  assert.equal(sealed.request.recipient, merchant.address);
   assert.equal(sealed.request.signature, signed.signature);
   assert.equal(sealed.memoId, deriveMemoId(request.requestId));
   const link = decodePayLink(sealed.token);
@@ -362,7 +365,7 @@ test("merchant cancellation signature authorizes only that request", async () =>
   assert.equal(
     cancelOffer({
       token,
-      address: request.recipient,
+      address: other.address,
       paid: false,
       cancelled: false,
       nowSeconds: EXPIRES_AT - 1,
@@ -415,6 +418,50 @@ test("V1 cancel offer stays the legacy payee check", () => {
       cancelled: false,
       nowSeconds: EXPIRES_AT,
     }),
+    null,
+  );
+});
+
+test("a V2 request with recipient !== merchant cannot be sealed", async () => {
+  const request = unsigned();
+  const signed = await signFinalRequest(request, MERCHANT_KEY);
+  const mismatched = { ...request, recipient: other.address };
+  await assert.rejects(
+    () =>
+      sealSignedV2Request({
+        request: mismatched,
+        signature: signed.signature,
+        connectedMerchant: merchant.address,
+        nowSeconds: EXPIRES_AT - 1,
+      }),
+    /merchant wallet/,
+  );
+});
+
+test("a V2 request whose recipient is not the merchant never falls back to V1", async () => {
+  const request = await sealed();
+  const bytes = new TextEncoder().encode(
+    JSON.stringify({
+      v: 2,
+      requestId: request.requestId,
+      merchant: request.merchant,
+      recipient: other.address,
+      amountBaseUnits: request.amountBaseUnits.toString(),
+      memo: request.memo,
+      chainId: request.chainId,
+      expiresAt: request.expiresAt,
+      nonce: request.nonce,
+      signature: request.signature,
+    }),
+  );
+  let bin = "";
+  for (const byte of bytes) bin += String.fromCharCode(byte);
+  const token = btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  assert.equal(claimsV2PayToken(token), true);
+  assert.equal(decodePayLink(token), null);
+  assert.equal(decodePayRequest(token), null);
+  assert.equal(
+    lookupFromRecord({ token, to: other.address, amount: "1.25", memo: request.memo, cancelled: false }),
     null,
   );
 });

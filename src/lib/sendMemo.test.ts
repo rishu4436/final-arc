@@ -56,7 +56,7 @@ async function signedRequest(
       version: 2,
       requestId: overrides.requestId ?? REQUEST_A,
       merchant: merchant.address,
-      recipient: overrides.recipient ?? RECIPIENT,
+      recipient: overrides.recipient ?? merchant.address,
       amountBaseUnits: 1_250_000n,
       memo: overrides.memo ?? MEMO,
       chainId: 5042,
@@ -72,7 +72,7 @@ function unsignedBase(amountBaseUnits: bigint, memo: string, requestId: Hex): Fi
     version: 2,
     requestId,
     merchant: merchant.address,
-    recipient: RECIPIENT,
+    recipient: merchant.address,
     amountBaseUnits,
     memo,
     chainId: 5042,
@@ -268,12 +268,13 @@ test("a V2 Arc Memo call uses deriveMemoId and the human memo as memoData", asyn
   assert.equal(call.memoId, deriveMemoId(request.requestId));
   assert.notEqual(call.memoId, legacyMemoId(request.memo));
   assert.equal(hexToString(call.memoData), request.memo);
-  assert.equal(call.recipient, RECIPIENT);
+  assert.equal(call.recipient, merchant.address);
+  assert.equal(request.recipient, merchant.address);
   assert.equal(call.amountBaseUnits, request.amountBaseUnits);
 
   const decoded = decodeFunctionData({ abi: erc20Abi, data: call.data });
   assert.equal(decoded.functionName, "transfer");
-  assert.deepEqual(decoded.args, [RECIPIENT, 1_250_000n]);
+  assert.deepEqual(decoded.args, [merchant.address, 1_250_000n]);
 
   const { client, captured } = clientSpy();
   const input: V2SendMemoInput = {
@@ -294,4 +295,22 @@ test("a V2 Arc Memo call uses deriveMemoId and the human memo as memoData", asyn
 test("V2 settlement rejects a request that was never signed", async () => {
   const request = unsignedBase(1_250_000n, MEMO, REQUEST_A);
   await assert.rejects(() => buildV2MemoSettlement(request, NOW), /signature/);
+});
+
+test("a V2 request with recipient !== merchant cannot be authorized", async () => {
+  const request = await signedRequest();
+  const mismatched: FinalRequest = { ...request, recipient: OTHER_RECIPIENT };
+  await assert.rejects(() => authorizeV2MemoSettlement(mismatched, NOW), /merchant wallet/);
+  await assert.rejects(() => buildV2MemoSettlement(mismatched, NOW), /merchant wallet/);
+
+  const { client, captured } = clientSpy();
+  const input: V2SendMemoInput = {
+    version: 2,
+    request: mismatched,
+    ...settlementClients(client),
+  };
+  const result = await sendMemoPayment(input);
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.message, /merchant wallet/);
+  assert.deepEqual(captured, []);
 });

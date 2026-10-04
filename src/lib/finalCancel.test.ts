@@ -174,7 +174,7 @@ test("a payment signature is not a cancellation signature", async () => {
       version: 2,
       requestId: REQUEST_A,
       merchant: merchant.address,
-      recipient: RECIPIENT,
+      recipient: merchant.address,
       amountBaseUnits: 1_000_000n,
       memo: "invoice",
       chainId: ARC_CHAIN_ID,

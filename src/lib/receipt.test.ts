@@ -225,7 +225,7 @@ async function v2Request(overrides: Partial<FinalRequest> = {}): Promise<FinalRe
     version: 2 as const,
     requestId: REQUEST_A,
     merchant: merchant.address,
-    recipient: RECIPIENT,
+    recipient: merchant.address,
     amountBaseUnits: AMOUNT,
     memo: "INV-1042",
     chainId: ARC_CHAIN_ID as 5042,
@@ -349,7 +349,11 @@ test("V1 does not accept a V2 memo id for the same human memo", async () => {
 test("correct V2 memo id and USDC settlement verify", async () => {
   const request = await v2Request();
   const receipt = asReceipt({
-    logs: settledLogs({ memoId: deriveMemoId(request.requestId), memo: request.memo }),
+    logs: settledLogs({
+      memoId: deriveMemoId(request.requestId),
+      memo: request.memo,
+      to: request.recipient,
+    }),
   });
   const parsed = parseMemoReceipt(receipt);
   assert.equal(parsed.memoId, deriveMemoId(request.requestId));
@@ -385,6 +389,7 @@ test("human memo text does not decide V2 identity", async () => {
     logs: settledLogs({
       memoId: deriveMemoId(request.requestId),
       memo: "shown on the receipt, not the key",
+      to: request.recipient,
     }),
   });
   const parsed = parseMemoReceipt(receipt);
@@ -421,18 +426,20 @@ test("non-USDC Memo target is not a USDC settlement", async () => {
 });
 
 test("wrong recipient and wrong amount are rejected", async () => {
+  const request = await v2Request();
   const memoId = deriveMemoId(REQUEST_A);
-  const receipt = asReceipt({ logs: settledLogs({ memoId }) });
-  const wrongRecipient = await v2Request({ recipient: OTHER });
-  const wrongAmount = await v2Request({ amountBaseUnits: 1n });
+  const wrongRecipientReceipt = asReceipt({ logs: settledLogs({ memoId, to: OTHER }) });
+  const wrongAmountReceipt = asReceipt({
+    logs: settledLogs({ memoId, to: request.recipient, value: 1n }),
+  });
   const recipientResult = await verifyReceiptForRequest(
-    receipt,
-    { version: 2, request: wrongRecipient },
+    wrongRecipientReceipt,
+    { version: 2, request },
     OBSERVATION,
   );
   const amountResult = await verifyReceiptForRequest(
-    receipt,
-    { version: 2, request: wrongAmount },
+    wrongAmountReceipt,
+    { version: 2, request },
     OBSERVATION,
   );
   assert.equal(recipientResult.memoEventValid, true);
@@ -539,7 +546,7 @@ test("a wrong V2 signature is rejected even when the logs match", async () => {
     signature: (request.signature.slice(0, -2) + (request.signature.endsWith("aa") ? "bb" : "aa")) as Hex,
   };
   const receipt = asReceipt({
-    logs: settledLogs({ memoId: deriveMemoId(request.requestId) }),
+    logs: settledLogs({ memoId: deriveMemoId(request.requestId), to: request.recipient }),
   });
   const result = await verifyReceiptForRequest(
     receipt,
@@ -564,7 +571,7 @@ test("altered requestId is rejected", async () => {
 test("expiry is the settlement block time", async () => {
   const request = await v2Request({ expiresAt: 500 });
   const receipt = asReceipt({
-    logs: settledLogs({ memoId: deriveMemoId(request.requestId) }),
+    logs: settledLogs({ memoId: deriveMemoId(request.requestId), to: request.recipient }),
   });
   const result = await verifyReceiptForRequest(
     receipt,
@@ -602,4 +609,23 @@ test("a cancelled V2 request is not an exact settlement", async () => {
   );
   assert.equal(result.exactForRequest, false);
   assert.equal(result.reason, "cancelled");
+});
+
+test("a V2 request with recipient !== merchant is not a valid settlement", async () => {
+  const request = await v2Request();
+  const memo = "INV-1042";
+  const receipt = asReceipt({
+    logs: settledLogs({ memoId: legacyMemoId(memo), memo, to: OTHER }),
+  });
+  const asV1 = await verifyReceiptForRequest(receipt, { to: OTHER, amount: "0.1", memo });
+  assert.equal(asV1.exactForRequest, true);
+  const malformed: FinalRequest = { ...request, recipient: OTHER };
+  const result = await verifyReceiptForRequest(
+    receipt,
+    { version: 2, request: malformed },
+    OBSERVATION,
+  );
+  assert.equal(result.exactForRequest, false);
+  assert.equal(result.settlementValid, false);
+  assert.equal(result.reason, "structure");
 });

@@ -218,11 +218,18 @@ export function validateFinalRequest(draft: FinalRequestDraft): UnsignedFinalReq
     throw new Error("expiresAt must be a unix timestamp in seconds.");
   }
 
+  const merchant = parseAddress(draft.merchant, "Merchant");
+  const recipient = parseAddress(draft.recipient, "Recipient");
+  // Checksummed comparison: case-only differences are the same address.
+  if (merchant !== recipient) {
+    throw new Error("Recipient must be the merchant wallet.");
+  }
+
   return {
     version: FINAL_REQUEST_VERSION,
     requestId: parseFixedHex(draft.requestId, REQUEST_ID_BYTES, "requestId"),
-    merchant: parseAddress(draft.merchant, "Merchant"),
-    recipient: parseAddress(draft.recipient, "Recipient"),
+    merchant,
+    recipient,
     amountBaseUnits: draft.amountBaseUnits,
     memo,
     chainId: ARC_CHAIN_ID,
@@ -249,7 +256,8 @@ export function createUnsignedFinalRequest(input: CreateFinalRequestInput): Unsi
     version: FINAL_REQUEST_VERSION,
     requestId: input.requestId ?? generateRequestId(),
     merchant: input.merchant,
-    recipient: input.recipient,
+    // The payer always pays the merchant who signs. A different recipient is not selectable.
+    recipient: input.merchant,
     amountBaseUnits: parseUsdcBaseUnits(input.amount),
     memo: input.memo.trim(),
     chainId: input.chainId ?? ARC_CHAIN_ID,

@@ -34,7 +34,7 @@ function draft(overrides: Partial<FinalRequestDraft> = {}): FinalRequestDraft {
     version: 2,
     requestId: "0x" + "11".repeat(16),
     merchant: merchant.address,
-    recipient: RECIPIENT,
+    recipient: merchant.address,
     amountBaseUnits: 1_000_000n,
     memo: "INV-1042",
     chainId: ARC_CHAIN_ID,
@@ -142,6 +142,37 @@ test("a valid Arc V2 request is accepted", () => {
   assert.doesNotThrow(() => assertFinalRequestActive(request, EXPIRES_AT - 1));
 });
 
+test("a new V2 request sets recipient to the merchant", () => {
+  const created = createUnsignedFinalRequest({
+    merchant: merchant.address.toLowerCase(),
+    recipient: RECIPIENT,
+    amount: "1",
+    memo: "INV-1042",
+    expiresAt: EXPIRES_AT,
+    requestId: "0x" + "11".repeat(16),
+    nonce: "0x" + "22".repeat(32),
+  });
+  assert.equal(created.merchant, merchant.address);
+  assert.equal(created.recipient, created.merchant);
+  assert.notEqual(created.recipient.toLowerCase(), RECIPIENT);
+});
+
+test("the same address in another case is still the merchant", () => {
+  const request = validateFinalRequest(
+    draft({
+      merchant: merchant.address.toLowerCase(),
+      recipient: merchant.address.toUpperCase().replace("0X", "0x"),
+    }),
+  );
+  assert.equal(request.merchant, merchant.address);
+  assert.equal(request.recipient, request.merchant);
+});
+
+test("validation rejects a V2 request whose recipient is not the merchant", () => {
+  assert.throws(() => validateFinalRequest(draft({ recipient: RECIPIENT })), /merchant wallet/);
+  assert.throws(() => validateFinalRequest(draft({ recipient: OTHER_RECIPIENT })), /merchant wallet/);
+});
+
 test("validation rejects wrong chain, recipient, and memo", () => {
   assert.throws(() => validateFinalRequest(draft({ chainId: 1 })), /Arc-only/);
   assert.throws(() => validateFinalRequest(draft({ recipient: "not-an-address" })), /Recipient/);
@@ -187,6 +218,7 @@ test("a signature verifies to the merchant and rejects every mutated field or do
   });
   const signed = await signFinalRequest(unsigned, TEST_PRIVATE_KEY);
   assert.equal(signed.merchant, merchant.address);
+  assert.equal(signed.recipient, merchant.address);
   assert.equal(await verifyFinalRequest(signed), true);
 
   const mutated: FinalRequest[] = [

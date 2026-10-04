@@ -63,7 +63,7 @@ async function signed(
       version: 2,
       requestId: overrides.requestId ?? REQUEST_A,
       merchant: merchant.address,
-      recipient: overrides.recipient ?? RECIPIENT,
+      recipient: overrides.recipient ?? merchant.address,
       amountBaseUnits: overrides.amountBaseUnits ?? AMOUNT,
       memo: overrides.memo ?? MEMO,
       chainId: 5042,
@@ -261,8 +261,9 @@ test("V2 request with the matching Memo event is paid", async () => {
 });
 
 test("V2 request with exact recipient and amount is paid", async () => {
-  const request = await signed({ amountBaseUnits: 1_250_000n, recipient: RECIPIENT });
-  const receipt = arcReceipt({ request, amount: 1_250_000n, recipient: RECIPIENT });
+  const request = await signed({ amountBaseUnits: 1_250_000n });
+  assert.equal(request.recipient, request.merchant);
+  const receipt = arcReceipt({ request, amount: 1_250_000n, recipient: request.recipient });
   const hash = await matchV2Settlement({ version: 2, request }, seen(receipt));
   assert.equal(hash, receipt.transactionHash);
 });
@@ -289,9 +290,16 @@ test("different memoId does not match", async () => {
 });
 
 test("different recipient does not match", async () => {
-  const request = await signed({ recipient: RECIPIENT });
+  const request = await signed();
   const receipt = arcReceipt({ request, recipient: OTHER });
   assert.equal(await matchV2Settlement({ version: 2, request }, seen(receipt)), null);
+});
+
+test("a V2 request paying a wallet other than the merchant is not a settlement", async () => {
+  const request = await signed();
+  const mismatched: FinalRequest = { ...request, recipient: OTHER };
+  const receipt = arcReceipt({ request: mismatched, recipient: OTHER });
+  assert.equal(await matchV2Settlement({ version: 2, request: mismatched }, seen(receipt)), null);
 });
 
 test("different amount does not match", async () => {
