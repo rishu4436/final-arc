@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { mock, test } from "node:test";
 import {
   encodeAbiParameters,
   encodeEventTopics,
@@ -19,9 +19,12 @@ import { privateKeyToAccount } from "viem/accounts";
 import { ARC_CHAIN_ID, MEMO_ADDRESS, USDC_ADDRESS, memoAbi } from "./arc";
 import { deriveMemoId, signFinalRequest, type FinalRequest } from "./finalRequest";
 import {
+  findSettlementProof,
+  lookbackLogPages,
   lookupFromRecord,
   matchV1Settlement,
   matchV2Settlement,
+  payClient,
   payRecordIdentity,
   selectPaidTx,
   type SettlementObservation,
@@ -650,5 +653,268 @@ test("same V2 settlement twice keeps one paidTx and a second hash cannot replace
       else process.env[key] = value;
     }
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+const HEAD = 1_000_000n;
+const MAX_LOG_SPAN = 9_999n;
+const WINDOW_START = HEAD - 400_000n;
+
+function pagesCoverLookback(head: bigint, pages: { fromBlock: bigint; toBlock: bigint }[]) {
+  const start = head > 400_000n ? head - 400_000n : 0n;
+  assert.ok(pages.length > 0);
+  assert.equal(pages[0]?.toBlock, head);
+  assert.equal(pages[pages.length - 1]?.fromBlock, start);
+  let cursor = head;
+  let covered = 0n;
+  for (const page of pages) {
+    const span = page.toBlock - page.fromBlock;
+    assert.ok(span >= 0n);
+    assert.ok(span <= MAX_LOG_SPAN);
+    assert.equal(page.toBlock, cursor);
+    covered += span + 1n;
+    cursor = page.fromBlock - 1n;
+  }
+  assert.equal(cursor + 1n, start);
+  assert.equal(covered, head - start + 1n);
+}
+
+test("a 400,000-block lookback is paged newest-first within the Arc getLogs span", () => {
+  const pages = lookbackLogPages(HEAD);
+  pagesCoverLookback(HEAD, pages);
+  assert.equal(pages[0]?.fromBlock, HEAD - MAX_LOG_SPAN);
+  assert.equal(pages[1]?.toBlock, pages[0]!.fromBlock - 1n);
+  const last = pages[pages.length - 1]!;
+  assert.ok(last.toBlock - last.fromBlock < MAX_LOG_SPAN);
+  assert.equal(pages.length, 41);
+
+  const atLimit = lookbackLogPages(400_000n);
+  pagesCoverLookback(400_000n, atLimit);
+  assert.equal(atLimit[atLimit.length - 1]?.fromBlock, 0n);
+
+  const short = lookbackLogPages(50n);
+  assert.deepEqual(short, [{ fromBlock: 0n, toBlock: 50n }]);
+});
+
+type PageCall = { fromBlock: bigint; toBlock: bigint; memoId?: Hex };
+
+function installPayRpc(opts: {
+  head?: bigint;
+  logsFor: (page: PageCall) => { transactionHash: Hash }[];
+  receiptFor?: (hash: Hash) => TransactionReceipt;
+  failGetLogs?: Error;
+}) {
+  const head = opts.head ?? HEAD;
+  const calls: PageCall[] = [];
+  const getBlockNumber = mock.method(payClient, "getBlockNumber", async () => head);
+  const getLogs = mock.method(
+    payClient,
+    "getLogs",
+    async (args?: { fromBlock?: bigint; toBlock?: bigint; args?: { memoId?: Hex } }) => {
+      const fromBlock = args?.fromBlock ?? 0n;
+      const toBlock = args?.toBlock ?? head;
+      const call = { fromBlock, toBlock, memoId: args?.args?.memoId };
+      calls.push(call);
+      if (toBlock - fromBlock > MAX_LOG_SPAN) {
+        throw Object.assign(new Error("requested range too large"), { code: -32012 });
+      }
+      if (opts.failGetLogs) throw opts.failGetLogs;
+      return opts.logsFor(call);
+    },
+  );
+  const getTransactionReceipt = mock.method(
+    payClient,
+    "getTransactionReceipt",
+    async (args: { hash: Hash }) => {
+      if (!opts.receiptFor) throw new Error("unexpected receipt lookup");
+      return opts.receiptFor(args.hash);
+    },
+  );
+  const getBlock = mock.method(payClient, "getBlock", async () => ({ timestamp: SETTLED_AT }));
+  return {
+    calls,
+    restore() {
+      getBlockNumber.mock.restore();
+      getLogs.mock.restore();
+      getTransactionReceipt.mock.restore();
+      getBlock.mock.restore();
+    },
+  };
+}
+
+function v1Lookup() {
+  return { version: 1 as const, to: RECIPIENT, amount: "1", memo: MEMO };
+}
+
+function v1PaidReceipt(hash: Hash): TransactionReceipt {
+  return arcReceipt({
+    hash,
+    loose: true,
+    memoId: legacyMemoId(MEMO),
+    memo: MEMO,
+    recipient: RECIPIENT,
+    amount: AMOUNT,
+  });
+}
+
+test("V1 settlement lookup pages the full lookback and does not request a later page after a match", async () => {
+  const block = HEAD - MAX_LOG_SPAN;
+  const rpc = installPayRpc({
+    logsFor: (page) =>
+      page.fromBlock <= block && block <= page.toBlock ? [{ transactionHash: TX_A }] : [],
+    receiptFor: () => v1PaidReceipt(TX_A),
+  });
+  try {
+    const proof = await findSettlementProof(v1Lookup());
+    assert.equal(proof?.version, 1);
+    assert.equal(proof?.tx, TX_A);
+    assert.equal(rpc.calls.length, 1);
+    assert.equal(rpc.calls[0]?.toBlock, HEAD);
+    assert.equal(rpc.calls[0]?.fromBlock, block);
+    assert.equal(rpc.calls[0]?.memoId, legacyMemoId(MEMO));
+    assert.ok(rpc.calls.every((call) => call.toBlock - call.fromBlock <= MAX_LOG_SPAN));
+  } finally {
+    rpc.restore();
+  }
+});
+
+test("V1 settlement lookup finds a match on an older page, including the page boundary", async () => {
+  const block = HEAD - MAX_LOG_SPAN - 1n;
+  const rpc = installPayRpc({
+    logsFor: (page) =>
+      page.fromBlock <= block && block <= page.toBlock ? [{ transactionHash: TX_A }] : [],
+    receiptFor: (hash) => (hash === TX_A ? v1PaidReceipt(TX_A) : v1PaidReceipt(TX_B)),
+  });
+  try {
+    const proof = await findSettlementProof(v1Lookup());
+    assert.equal(proof?.tx, TX_A);
+    assert.equal(rpc.calls.length, 2);
+    assert.equal(rpc.calls[0]?.toBlock, HEAD);
+    assert.equal(rpc.calls[1]?.toBlock, rpc.calls[0]!.fromBlock - 1n);
+    assert.equal(rpc.calls[1]?.toBlock, block);
+    const covering = rpc.calls.filter((call) => call.fromBlock <= block && block <= call.toBlock);
+    assert.equal(covering.length, 1);
+    assert.ok(rpc.calls.every((call) => call.toBlock - call.fromBlock <= MAX_LOG_SPAN));
+  } finally {
+    rpc.restore();
+  }
+});
+
+test("V1 settlement lookup covers the existing 400,000-block window when nothing matches", async () => {
+  const rpc = installPayRpc({ logsFor: () => [] });
+  try {
+    assert.equal(await findSettlementProof(v1Lookup()), null);
+    assert.deepEqual(
+      rpc.calls.map(({ fromBlock, toBlock }) => ({ fromBlock, toBlock })),
+      lookbackLogPages(HEAD),
+    );
+    pagesCoverLookback(HEAD, rpc.calls);
+    assert.equal(rpc.calls[rpc.calls.length - 1]?.fromBlock, WINDOW_START);
+  } finally {
+    rpc.restore();
+  }
+});
+
+test("a V1 getLogs range error is not reported as unpaid", async () => {
+  const rpc = installPayRpc({
+    logsFor: () => [],
+    failGetLogs: Object.assign(new Error("requested range too large"), { code: -32012 }),
+  });
+  try {
+    await assert.rejects(findSettlementProof(v1Lookup()), (error: unknown) => {
+      assert.equal((error as { code?: number }).code, -32012);
+      return true;
+    });
+    assert.equal(rpc.calls.length, 1);
+    assert.ok(rpc.calls[0]!.toBlock - rpc.calls[0]!.fromBlock <= MAX_LOG_SPAN);
+  } finally {
+    rpc.restore();
+  }
+});
+
+test("V2 settlement lookup pages newest-first and stops when the first page verifies", async () => {
+  const request = await signed();
+  const block = HEAD - MAX_LOG_SPAN;
+  const rpc = installPayRpc({
+    logsFor: (page) =>
+      page.fromBlock <= block && block <= page.toBlock ? [{ transactionHash: TX_A }] : [],
+    receiptFor: () => arcReceipt({ request, hash: TX_A }),
+  });
+  try {
+    const proof = await findSettlementProof({ version: 2, request });
+    assert.equal(proof?.version, 2);
+    assert.equal(proof?.tx, TX_A);
+    assert.equal(rpc.calls.length, 1);
+    assert.equal(rpc.calls[0]?.toBlock, HEAD);
+    assert.equal(rpc.calls[0]?.fromBlock, block);
+    assert.equal(rpc.calls[0]?.memoId, deriveMemoId(request.requestId));
+    assert.ok(rpc.calls.every((call) => call.toBlock - call.fromBlock <= MAX_LOG_SPAN));
+  } finally {
+    rpc.restore();
+  }
+});
+
+test("V2 settlement lookup verifies a match on a later page and does not skip the boundary block", async () => {
+  const request = await signed();
+  const block = HEAD - MAX_LOG_SPAN - 1n;
+  const rpc = installPayRpc({
+    logsFor: (page) => {
+      if (page.toBlock === HEAD) return [{ transactionHash: TX_B }];
+      if (page.fromBlock <= block && block <= page.toBlock) return [{ transactionHash: TX_A }];
+      return [];
+    },
+    receiptFor: (hash) =>
+      arcReceipt({
+        request,
+        hash,
+        amount: hash === TX_A ? request.amountBaseUnits : request.amountBaseUnits + 1n,
+      }),
+  });
+  try {
+    const proof = await findSettlementProof({ version: 2, request });
+    assert.equal(proof?.version, 2);
+    assert.equal(proof?.tx, TX_A);
+    assert.equal(rpc.calls.length, 2);
+    assert.equal(rpc.calls[1]?.toBlock, block);
+    assert.equal(rpc.calls[0]?.fromBlock, block + 1n);
+    const covering = rpc.calls.filter((call) => call.fromBlock <= block && block <= call.toBlock);
+    assert.equal(covering.length, 1);
+    assert.ok(rpc.calls.every((call) => call.toBlock - call.fromBlock <= MAX_LOG_SPAN));
+  } finally {
+    rpc.restore();
+  }
+});
+
+test("V2 settlement lookup covers the full 400,000-block lookback with no match", async () => {
+  const request = await signed();
+  const rpc = installPayRpc({ logsFor: () => [] });
+  try {
+    assert.equal(await findSettlementProof({ version: 2, request }), null);
+    assert.deepEqual(
+      rpc.calls.map(({ fromBlock, toBlock }) => ({ fromBlock, toBlock })),
+      lookbackLogPages(HEAD),
+    );
+    pagesCoverLookback(HEAD, rpc.calls);
+    assert.equal(rpc.calls.at(-1)?.fromBlock, WINDOW_START);
+  } finally {
+    rpc.restore();
+  }
+});
+
+test("a V2 getLogs range error is not reported as unpaid", async () => {
+  const request = await signed();
+  const rpc = installPayRpc({
+    logsFor: () => [],
+    failGetLogs: Object.assign(new Error("requested range too large"), { code: -32012 }),
+  });
+  try {
+    await assert.rejects(findSettlementProof({ version: 2, request }), (error: unknown) => {
+      assert.equal((error as { code?: number }).code, -32012);
+      return true;
+    });
+    assert.equal(rpc.calls.length, 1);
+    assert.ok((rpc.calls[0]?.toBlock ?? 0n) - (rpc.calls[0]?.fromBlock ?? 0n) <= MAX_LOG_SPAN);
+  } finally {
+    rpc.restore();
   }
 });

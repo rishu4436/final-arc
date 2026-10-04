@@ -7,6 +7,7 @@ import {
   parseUnits,
   type Address,
   type Hash,
+  type Hex,
   type TransactionReceipt,
 } from "viem";
 import { ARC_CHAIN_ID, ARC_RPC, MEMO_ADDRESS, USDC_ADDRESS, USDC_DECIMALS, arc, memoAbi } from "./arc";
@@ -21,12 +22,42 @@ import { verifyReceiptForRequest } from "./receipt";
 import { legacyMemoId } from "./sendMemo";
 import { type PaidProof } from "./payStore";
 
-const client = createPublicClient({
+export const payClient = createPublicClient({
   chain: arc,
   transport: http(ARC_RPC),
 });
 
 const LOOKBACK_BLOCKS = 400_000n;
+/**
+ * Arc mainnet eth_getLogs returns JSON-RPC -32012 when `toBlock - fromBlock`
+ * is greater than this. 9999 succeeds; 10000 fails. The lookback stays
+ * LOOKBACK_BLOCKS and is scanned in pages of this span.
+ */
+const MAX_GETLOGS_BLOCK_SPAN = 9_999n;
+
+export type LogBlockPage = { fromBlock: bigint; toBlock: bigint };
+
+/**
+ * Inclusive newest-first pages for the existing lookback window.
+ * `latest > LOOKBACK_BLOCKS` starts at `latest - LOOKBACK_BLOCKS`; otherwise at 0.
+ * Each page has `toBlock - fromBlock <= MAX_GETLOGS_BLOCK_SPAN`.
+ * The next older page starts at `fromBlock - 1`, so every block is queried once.
+ */
+export function lookbackLogPages(latest: bigint): LogBlockPage[] {
+  const windowStart = latest > LOOKBACK_BLOCKS ? latest - LOOKBACK_BLOCKS : 0n;
+  const pages: LogBlockPage[] = [];
+  let toBlock = latest;
+  while (toBlock >= windowStart) {
+    const fromBlock =
+      toBlock > windowStart + MAX_GETLOGS_BLOCK_SPAN
+        ? toBlock - MAX_GETLOGS_BLOCK_SPAN
+        : windowStart;
+    pages.push({ fromBlock, toBlock });
+    if (fromBlock === windowStart) break;
+    toBlock = fromBlock - 1n;
+  }
+  return pages;
+}
 
 /** Legacy payment link. `version` omitted means V1. Identity is keccak256(utf8(memo)). */
 export type V1PaidLookup = {
@@ -233,70 +264,67 @@ function memoEventAbi() {
   return memoAbi.find((item) => item.type === "event" && item.name === "Memo");
 }
 
+/**
+ * Page the lookback newest-first. A matching log is verified by `accept`
+ * before older pages are requested. getLogs errors, including -32012, propagate.
+ */
+async function scanMemoLogs<T>(
+  memoId: Hex,
+  accept: (transactionHash: Hash) => Promise<T | null>,
+): Promise<T | null> {
+  const latest = await payClient.getBlockNumber();
+  const memoEvent = memoEventAbi();
+  if (!memoEvent) return null;
+  for (const page of lookbackLogPages(latest)) {
+    const logs = await payClient.getLogs({
+      address: MEMO_ADDRESS,
+      event: memoEvent,
+      args: { memoId },
+      fromBlock: page.fromBlock,
+      toBlock: page.toBlock,
+    });
+    for (const log of logs.slice().reverse()) {
+      const found = await accept(log.transactionHash);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
 async function findPaidTxV1(lookup: V1PaidLookup): Promise<Hash | null> {
   const memoId = legacyMemoId(lookup.memo);
   // Throw before any RPC if the amount string is not a V1 USDC amount.
   parseUnits(lookup.amount, USDC_DECIMALS);
-  const latest = await client.getBlockNumber();
-  const fromBlock = latest > LOOKBACK_BLOCKS ? latest - LOOKBACK_BLOCKS : 0n;
-  const memoEvent = memoEventAbi();
-  if (!memoEvent) return null;
-
-  const logs = await client.getLogs({
-    address: MEMO_ADDRESS,
-    event: memoEvent,
-    args: { memoId },
-    fromBlock,
-    toBlock: latest,
+  return scanMemoLogs(memoId, async (transactionHash) => {
+    const receipt = await payClient.getTransactionReceipt({ hash: transactionHash });
+    return matchV1Settlement(lookup, receipt);
   });
-
-  for (const log of logs.slice().reverse()) {
-    const receipt = await client.getTransactionReceipt({ hash: log.transactionHash });
-    const hash = matchV1Settlement(lookup, receipt);
-    if (hash) return hash;
-  }
-  return null;
 }
 
 async function findProofV2(lookup: V2PaidLookup): Promise<PaidProof | null> {
   if (lookup.cancelled) return null;
   const signed = await verifyFinalRequest(lookup.request);
   if (!signed) return null;
-  if (client.chain?.id !== ARC_CHAIN_ID) return null;
+  if (payClient.chain?.id !== ARC_CHAIN_ID) return null;
 
   const fields = validateFinalRequest(lookup.request);
   const memoId = deriveMemoId(fields.requestId);
-  const latest = await client.getBlockNumber();
-  const fromBlock = latest > LOOKBACK_BLOCKS ? latest - LOOKBACK_BLOCKS : 0n;
-  const memoEvent = memoEventAbi();
-  if (!memoEvent) return null;
-
-  const logs = await client.getLogs({
-    address: MEMO_ADDRESS,
-    event: memoEvent,
-    args: { memoId },
-    fromBlock,
-    toBlock: latest,
-  });
-
-  for (const log of logs.slice().reverse()) {
-    const receipt = await client.getTransactionReceipt({ hash: log.transactionHash });
-    if (receipt.status !== "success") continue;
-    const block = await client.getBlock({ blockNumber: receipt.blockNumber });
-    const proof = await v2SettlementProof(lookup, {
+  return scanMemoLogs(memoId, async (transactionHash) => {
+    const receipt = await payClient.getTransactionReceipt({ hash: transactionHash });
+    if (receipt.status !== "success") return null;
+    const block = await payClient.getBlock({ blockNumber: receipt.blockNumber });
+    return v2SettlementProof(lookup, {
       receipt,
       blockTimestamp: block.timestamp,
       chainId: ARC_CHAIN_ID,
     });
-    if (proof) return proof;
-  }
-  return null;
+  });
 }
 
 /**
  * Locate the verified settlement for this request.
  * V1 uses the legacy memo hash. V2 uses verifyReceiptForRequest only.
- * The scan window stays LOOKBACK_BLOCKS. This function does not widen it.
+ * The scan window stays LOOKBACK_BLOCKS, paged at MAX_GETLOGS_BLOCK_SPAN. This function does not widen it.
  */
 export async function findSettlementProof(lookup: PaidLookup): Promise<PaidProof | null> {
   if (isV2PaidLookup(lookup)) return findProofV2(lookup);
