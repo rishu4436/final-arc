@@ -40,7 +40,7 @@ export function SampleReceipt() {
           </div>
           <div className="flex justify-between gap-4">
             <dt className="text-[var(--muted)]">Certificate</dt>
-            <dd className="text-right text-[var(--ok)]">12 validators</dd>
+            <dd className="text-right text-[var(--ok)]">height matched</dd>
           </div>
         </dl>
         <p className="mt-5 text-[11px] leading-relaxed text-[var(--muted)]">

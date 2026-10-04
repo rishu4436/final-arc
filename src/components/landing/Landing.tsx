@@ -35,11 +35,11 @@ const facts = [
   },
   {
     title: "Protocol memo",
-    body: "Not a description field in our database. Memo.memo on 0x5294…e505, with memoId = keccak256(text).",
+    body: "Not a description field in our database. Memo.memo on 0x5294…e505. V2 request identity derives the settlement memo ID.",
   },
   {
     title: "Final at inclusion",
-    body: "Arc’s Malachite BFT commits in one block. arc_getCertificate is the proof — height, round, validator signatures.",
+    body: "Certificate height and block hash are matched to the transaction. Validator signatures are displayed as provided by the certificate; this client does not cryptographically verify them.",
   },
 ];
 
@@ -89,8 +89,8 @@ export function Landing() {
             transition={{ duration: 0.7, delay: 0.45 }}
           >
             Send USDC through Arc’s Memo contract. The note lives on the chain.
-            One block later you hold a public page with a BFT certificate — not
-            a spinner asking for twelve confirmations.
+            One block later you hold a public receipt. Certificate height and
+            block hash are matched to the transaction — not a confirmation spinner.
           </motion.p>
           <motion.div
             className="mt-8 flex flex-wrap items-center gap-4"

@@ -96,7 +96,7 @@ export function HeroReceipt() {
               transition={{ delay: 0.75, duration: 0.5, ease: easeOut }}
             >
               <dt className="text-[var(--muted)]">Certificate</dt>
-              <dd className="text-right text-[var(--ok)]">12 validators</dd>
+              <dd className="text-right text-[var(--ok)]">height matched</dd>
             </motion.div>
           </dl>
           <p className="mt-5 text-[11px] leading-relaxed text-[var(--muted)]">

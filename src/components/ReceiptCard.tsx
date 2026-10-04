@@ -112,7 +112,7 @@ export function ReceiptCard({
 
         <div className="mt-10 border-t border-dashed border-[var(--line)] pt-6">
           <p className="text-xs uppercase tracking-[0.18em] text-[var(--muted)]">
-            BFT commit certificate
+            Block certificate
           </p>
           {certificate ? (
             <div className="mt-3 space-y-2 text-sm">
