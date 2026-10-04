@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "tsx --test src/lib/format.test.ts src/lib/receipt.test.ts src/lib/gas.test.ts src/lib/payRequest.test.ts src/lib/cctp.test.ts src/lib/finalRequest.test.ts src/lib/sendMemo.test.ts src/lib/payPaid.test.ts src/lib/finalCancel.test.ts"
+    "test": "tsx --test src/lib/format.test.ts src/lib/receipt.test.ts src/lib/gas.test.ts src/lib/payRequest.test.ts src/lib/cctp.test.ts src/lib/finalRequest.test.ts src/lib/sendMemo.test.ts src/lib/payPaid.test.ts src/lib/finalCancel.test.ts src/lib/payStore.test.ts src/lib/resolveCancellation.test.ts src/lib/paymentStatus.test.ts"
   },
   "dependencies": {
     "@circle-fin/adapter-viem-v2": "^1.18.0",

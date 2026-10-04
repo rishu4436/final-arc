@@ -3,11 +3,12 @@
 import { CrossChainPay } from "@/components/CrossChainPay";
 import { explorerAddress, explorerTx, formatUsdc, shortAddr } from "@/lib/format";
 import { USDC_DECIMALS } from "@/lib/arc";
-import { canOfferPay, decodePayLink, paymentLinkPhase, type PayLinkPhase } from "@/lib/payRequest";
+import { decodePayLink, type PayLinkPhase } from "@/lib/payRequest";
+import { paySheetOffer, type PayStatusAvailability } from "@/lib/paySheetStatus";
 import { verifyFinalRequest } from "@/lib/finalRequest";
 import type { PayRecord } from "@/lib/payStore";
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatUnits } from "viem";
 
 const PHASE_LABEL: Record<PayLinkPhase, string> = {
@@ -20,9 +21,25 @@ const PHASE_LABEL: Record<PayLinkPhase, string> = {
 export function PaySheet({ token }: { token: string }) {
   const link = useMemo(() => decodePayLink(token), [token]);
   const [record, setRecord] = useState<PayRecord | null>(null);
+  const [availability, setAvailability] = useState<PayStatusAvailability>("unknown");
   const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
   const [signatureOk, setSignatureOk] = useState<boolean | null>(link?.version === 2 ? null : true);
   const viewed = useRef(false);
+
+  const pullStatus = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/pay?token=${encodeURIComponent(token)}`);
+      const body = (await res.json().catch(() => ({}))) as { record?: PayRecord };
+      if (!res.ok || !body.record) {
+        setAvailability("failed");
+        return;
+      }
+      setRecord(body.record);
+      setAvailability("ready");
+    } catch {
+      setAvailability("failed");
+    }
+  }, [token]);
 
   useEffect(() => {
     if (!link || link.version !== 2) return;
@@ -46,28 +63,38 @@ export function PaySheet({ token }: { token: string }) {
     const key = `final-viewed:${token}`;
     const already = sessionStorage.getItem(key);
     const action = already ? "register" : "view";
+    let stopped = false;
     fetch("/api/pay", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ token, action }),
     })
-      .then((res) => res.json())
-      .then((body: { record?: PayRecord }) => {
-        if (body.record) setRecord(body.record);
+      .then(async (res) => {
+        const body = (await res.json().catch(() => ({}))) as { record?: PayRecord };
+        if (stopped) return;
+        if (!res.ok || !body.record) {
+          setAvailability("failed");
+          return;
+        }
+        setRecord(body.record);
+        setAvailability("ready");
         if (action === "view") sessionStorage.setItem(key, "1");
       })
-      .catch(() => undefined);
+      .catch(() => {
+        if (!stopped) setAvailability("failed");
+      });
 
+    return () => {
+      stopped = true;
+    };
+  }, [token]);
+
+  useEffect(() => {
     const poll = window.setInterval(() => {
-      fetch(`/api/pay?token=${encodeURIComponent(token)}`)
-        .then((res) => res.json())
-        .then((body: { record?: PayRecord }) => {
-          if (body.record) setRecord(body.record);
-        })
-        .catch(() => undefined);
+      void pullStatus();
     }, 8000);
     return () => window.clearInterval(poll);
-  }, [token]);
+  }, [pullStatus]);
 
   if (!link || signatureOk === false) {
     return <p className="text-[var(--stamp)]">This payment link is not valid.</p>;
@@ -77,12 +104,14 @@ export function PaySheet({ token }: { token: string }) {
   }
 
   const expiresAt = link.version === 2 ? link.request.expiresAt : null;
-  const phase = paymentLinkPhase({
+  const offer = paySheetOffer({
+    availability,
     paid: Boolean(record?.paidTx),
     cancelled: Boolean(record?.cancelled),
     expiresAt,
     nowSeconds,
   });
+  const phase: PayLinkPhase = offer.availability === "ready" ? offer.phase : "OPEN";
   const amount =
     link.version === 2
       ? formatUsdc(formatUnits(link.request.amountBaseUnits, USDC_DECIMALS))
@@ -94,7 +123,13 @@ export function PaySheet({ token }: { token: string }) {
     <article className="receipt-sheet">
       <div className="border-b border-[var(--line)] px-6 py-5 sm:px-8">
         <p className="text-[11px] uppercase tracking-[0.22em] text-[var(--muted)]">
-          {link.version === 2 ? `V2 · ${PHASE_LABEL[phase]} · Arc USDC` : PHASE_LABEL[phase]}
+          {offer.availability === "unknown"
+            ? "Checking payment status…"
+            : offer.availability === "failed"
+              ? "Unable to verify payment status."
+              : link.version === 2
+                ? `V2 · ${PHASE_LABEL[phase]} · Arc USDC`
+                : PHASE_LABEL[phase]}
         </p>
         <p className="mono mt-3 text-4xl tracking-tight">
           {amount}
@@ -140,7 +175,23 @@ export function PaySheet({ token }: { token: string }) {
         ) : null}
       </div>
       <div className="p-6 sm:p-8">
-        {phase === "PAID" && record?.paidTx ? (
+        {offer.availability === "unknown" ? (
+          <p className="text-sm text-[var(--muted)]">Checking payment status…</p>
+        ) : offer.availability === "failed" ? (
+          <div>
+            <p className="text-sm text-[var(--stamp)]">Unable to verify payment status.</p>
+            <button
+              type="button"
+              className="mt-3 text-sm underline"
+              onClick={() => {
+                setAvailability("unknown");
+                void pullStatus();
+              }}
+            >
+              Retry
+            </button>
+          </div>
+        ) : offer.showsReceipt && record?.paidTx ? (
           <p className="text-sm">
             Settled.{" "}
             <Link href={`/r/${record.paidTx}`} className="underline">
@@ -151,11 +202,11 @@ export function PaySheet({ token }: { token: string }) {
               Explorer
             </a>
           </p>
-        ) : phase === "CANCELLED" ? (
+        ) : offer.availability === "ready" && offer.phase === "CANCELLED" ? (
           <p className="text-sm text-[var(--stamp)]">This payment request has been cancelled.</p>
-        ) : phase === "EXPIRED" ? (
+        ) : offer.availability === "ready" && offer.phase === "EXPIRED" ? (
           <p className="text-sm text-[var(--stamp)]">This Arc USDC payment request has expired.</p>
-        ) : canOfferPay(phase) ? (
+        ) : offer.offersPay ? (
           link.version === 2 ? (
             <CrossChainPay version={2} request={link.request} />
           ) : (

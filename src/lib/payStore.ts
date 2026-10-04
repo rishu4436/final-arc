@@ -21,52 +21,107 @@ type StoreFile = { records: Record<string, PayRecord> };
 
 const KV_KEY = "final-pay-store";
 
-function kvCreds(): { url: string; token: string } | null {
-  if (process.env.FINAL_PAY_STORE) return null;
-  const url = process.env.KV_REST_API_URL ?? process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.KV_REST_API_TOKEN ?? process.env.UPSTASH_REDIS_REST_TOKEN;
+function completePair(urlName: string, tokenName: string): { url: string; token: string } | null {
+  const url = process.env[urlName];
+  const token = process.env[tokenName];
   if (!url || !token) return null;
   return { url: url.replace(/\/$/, ""), token };
+}
+
+/**
+ * Redis only when one provider pair is complete. A URL from one provider
+ * is never paired with a token from the other. FINAL_PAY_STORE forces the
+ * JSON file even if a Redis pair is present (local dev override).
+ */
+function kvCreds(): { url: string; token: string } | null {
+  if (process.env.FINAL_PAY_STORE) return null;
+  return (
+    completePair("KV_REST_API_URL", "KV_REST_API_TOKEN") ??
+    completePair("UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN")
+  );
 }
 
 function storePath(): string {
   return process.env.FINAL_PAY_STORE || join(process.cwd(), "data", "pay-store.json");
 }
 
-async function readKv(creds: { url: string; token: string }): Promise<StoreFile | null> {
-  const res = await fetch(`${creds.url}/get/${KV_KEY}`, {
-    headers: { Authorization: `Bearer ${creds.token}` },
-    cache: "no-store",
-  });
-  if (!res.ok) return null;
-  const body = (await res.json()) as { result?: string | null };
-  if (!body.result) return { records: {} };
+function isStoreFile(value: unknown): value is StoreFile {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const records = (value as StoreFile).records;
+  return !!records && typeof records === "object" && !Array.isArray(records);
+}
+
+/** Missing key (result null) is an empty store. Anything else malformed is a failure. */
+function parseKvResult(result: unknown): StoreFile {
+  if (result == null) return { records: {} };
+  if (typeof result !== "string") throw new Error("Payment store read failed.");
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(body.result) as StoreFile;
-    return parsed.records ? parsed : { records: {} };
+    parsed = JSON.parse(result);
   } catch {
-    return { records: {} };
+    throw new Error("Payment store read failed.");
   }
+  if (!isStoreFile(parsed)) throw new Error("Payment store read failed.");
+  return parsed;
+}
+
+async function discardBody(res: Response): Promise<void> {
+  try {
+    await res.body?.cancel();
+  } catch {
+    // The status is enough. Never surface the body; it can echo the request.
+  }
+}
+
+async function readKv(creds: { url: string; token: string }): Promise<StoreFile> {
+  let res: Response;
+  try {
+    res = await fetch(`${creds.url}/get/${KV_KEY}`, {
+      headers: { Authorization: `Bearer ${creds.token}` },
+      cache: "no-store",
+    });
+  } catch {
+    throw new Error("Payment store read failed.");
+  }
+  if (!res.ok) {
+    await discardBody(res);
+    throw new Error(`Payment store read failed. HTTP ${res.status}`);
+  }
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    throw new Error("Payment store read failed.");
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body) || !("result" in body)) {
+    throw new Error("Payment store read failed.");
+  }
+  return parseKvResult((body as { result?: unknown }).result);
 }
 
 async function writeKv(creds: { url: string; token: string }, store: StoreFile): Promise<void> {
   const value = JSON.stringify(store);
-  await fetch(`${creds.url}/set/${KV_KEY}`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${creds.token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(value),
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${creds.url}/set/${KV_KEY}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${creds.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(value),
+    });
+  } catch {
+    throw new Error("Payment store write failed.");
+  }
+  if (!res.ok) {
+    await discardBody(res);
+    throw new Error(`Payment store write failed. HTTP ${res.status}`);
+  }
+  await discardBody(res);
 }
 
-async function readStore(): Promise<StoreFile> {
-  const kv = kvCreds();
-  if (kv) {
-    const fromKv = await readKv(kv);
-    if (fromKv) return fromKv;
-  }
+async function readFileStore(): Promise<StoreFile> {
   try {
     const raw = await readFile(storePath(), "utf8");
     const parsed = JSON.parse(raw) as StoreFile;
@@ -77,7 +132,39 @@ async function readStore(): Promise<StoreFile> {
   }
 }
 
+async function readStore(): Promise<StoreFile> {
+  const kv = kvCreds();
+  if (kv) return readKv(kv);
+  return readFileStore();
+}
+
+/**
+ * Copy a stored paidTx or cancelled flag back onto the outgoing blob when
+ * the outgoing row would clear it, including when the outgoing blob dropped
+ * the row. Check-then-write, not compare-and-set: the Redis REST GET/SET
+ * interface has no conditional write, and this re-read is not atomic with
+ * the SET. A paidTx or cancellation that lands after this re-read can still
+ * be overwritten. Two overlapping writers can still lose unpaid field
+ * updates. A non-null paidTx can still be replaced by a different hash.
+ */
+function preserveDurableFlags(current: StoreFile, outgoing: StoreFile): void {
+  for (const [token, stored] of Object.entries(current.records)) {
+    const next = outgoing.records[token];
+    if (!next) {
+      if (stored.paidTx || stored.cancelled) outgoing.records[token] = stored;
+      continue;
+    }
+    if (stored.paidTx && !next.paidTx) next.paidTx = stored.paidTx;
+    if (stored.cancelled && !next.cancelled) {
+      next.cancelled = true;
+      next.cancelledAt = stored.cancelledAt;
+    }
+  }
+}
+
 async function writeStore(store: StoreFile): Promise<void> {
+  const current = await readStore();
+  preserveDurableFlags(current, store);
   const kv = kvCreds();
   if (kv) {
     await writeKv(kv, store);
@@ -92,7 +179,8 @@ async function writeStore(store: StoreFile): Promise<void> {
  * Whole-store read/modify/write (one JSON blob, or one Redis key).
  * Two writers can both read the same snapshot and the later write wins.
  * That race is not atomic. These helpers only define the single-writer
- * transition. They do not claim compare-and-swap.
+ * transition. They do not claim compare-and-swap. writeStore re-reads and
+ * refuses to clear paidTx or cancelled, but that check is not atomic either.
  */
 export type PayPhase = "OPEN" | "VIEWED" | "PAID" | "CANCELLED" | "EXPIRED";
 
