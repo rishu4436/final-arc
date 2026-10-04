@@ -32,6 +32,7 @@ import {
 import { encodePayRequest } from "./payRequest";
 import { getRecord, isDerivedExpired, markCancelled, markPaid, mergePayRecord, nextCancelledRecord, nextPaidRecord, payPhase, upsertRecord, type PaidProof, type PayRecord } from "./payStore";
 import { legacyMemoId } from "./sendMemo";
+import { logBlockPages } from "./logPages";
 
 /** Anvil/Hardhat account 0. Public test key, not a secret. */
 const TEST_PRIVATE_KEY =
@@ -682,6 +683,7 @@ function pagesCoverLookback(head: bigint, pages: { fromBlock: bigint; toBlock: b
 test("a 400,000-block lookback is paged newest-first within the Arc getLogs span", () => {
   const pages = lookbackLogPages(HEAD);
   pagesCoverLookback(HEAD, pages);
+  assert.deepEqual(pages, logBlockPages(HEAD, 400_000n));
   assert.equal(pages[0]?.fromBlock, HEAD - MAX_LOG_SPAN);
   assert.equal(pages[1]?.toBlock, pages[0]!.fromBlock - 1n);
   const last = pages[pages.length - 1]!;

@@ -11,13 +11,15 @@ import {
   type TransactionReceipt,
 } from "viem";
 import { ARC_RPC, MEMO_ADDRESS, USDC_ADDRESS, USDC_DECIMALS, arc, memoAbi } from "./arc";
+import { logBlockPages } from "./logPages";
 
-const client = createPublicClient({
+export const ledgerClient = createPublicClient({
   chain: arc,
   transport: http(ARC_RPC),
 });
 
-const LOOKBACK = 800_000n;
+/** Statement window. Paged, not widened, by logBlockPages. */
+export const LEDGER_LOOKBACK_BLOCKS = 800_000n;
 
 export type LedgerEntry = {
   txHash: Hash;
@@ -84,27 +86,32 @@ function entryFromReceipt(account: Address, receipt: TransactionReceipt): Ledger
 }
 
 export async function loadMemoLedger(account: Address): Promise<LedgerEntry[]> {
-  const latest = await client.getBlockNumber();
-  const fromBlock = latest > LOOKBACK ? latest - LOOKBACK : 0n;
+  const latest = await ledgerClient.getBlockNumber();
   const memoEvent = memoAbi.find((item) => item.type === "event" && item.name === "Memo");
   if (!memoEvent) return [];
 
-  const [outLogs, inLogs] = await Promise.all([
-    client.getLogs({
-      address: MEMO_ADDRESS,
-      event: memoEvent,
-      args: { sender: account },
-      fromBlock,
-      toBlock: latest,
-    }),
-    client.getLogs({
-      address: USDC_ADDRESS,
-      event: transferEvent,
-      args: { to: account },
-      fromBlock,
-      toBlock: latest,
-    }),
-  ]);
+  const outLogs: { transactionHash: Hash }[] = [];
+  const inLogs: { transactionHash: Hash }[] = [];
+  for (const page of logBlockPages(latest, LEDGER_LOOKBACK_BLOCKS)) {
+    const [outPage, inPage] = await Promise.all([
+      ledgerClient.getLogs({
+        address: MEMO_ADDRESS,
+        event: memoEvent,
+        args: { sender: account },
+        fromBlock: page.fromBlock,
+        toBlock: page.toBlock,
+      }),
+      ledgerClient.getLogs({
+        address: USDC_ADDRESS,
+        event: transferEvent,
+        args: { to: account },
+        fromBlock: page.fromBlock,
+        toBlock: page.toBlock,
+      }),
+    ]);
+    outLogs.push(...outPage);
+    inLogs.push(...inPage);
+  }
 
   const hashes = new Set<Hash>();
   for (const log of outLogs) hashes.add(log.transactionHash);
@@ -113,7 +120,7 @@ export async function loadMemoLedger(account: Address): Promise<LedgerEntry[]> {
   const entries: LedgerEntry[] = [];
   await Promise.all(
     [...hashes].map(async (hash) => {
-      const receipt = await client.getTransactionReceipt({ hash });
+      const receipt = await ledgerClient.getTransactionReceipt({ hash });
       const entry = entryFromReceipt(account, receipt);
       if (entry) entries.push(entry);
     }),

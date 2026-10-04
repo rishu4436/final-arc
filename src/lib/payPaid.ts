@@ -21,6 +21,7 @@ import { claimsV2PayToken, decodePayLink, decodePayRequest } from "./payRequest"
 import { verifyReceiptForRequest } from "./receipt";
 import { legacyMemoId } from "./sendMemo";
 import { type PaidProof } from "./payStore";
+import { logBlockPages, MAX_GETLOGS_BLOCK_SPAN, type LogBlockPage } from "./logPages";
 
 export const payClient = createPublicClient({
   chain: arc,
@@ -28,35 +29,17 @@ export const payClient = createPublicClient({
 });
 
 const LOOKBACK_BLOCKS = 400_000n;
-/**
- * Arc mainnet eth_getLogs returns JSON-RPC -32012 when `toBlock - fromBlock`
- * is greater than this. 9999 succeeds; 10000 fails. The lookback stays
- * LOOKBACK_BLOCKS and is scanned in pages of this span.
- */
-const MAX_GETLOGS_BLOCK_SPAN = 9_999n;
 
-export type LogBlockPage = { fromBlock: bigint; toBlock: bigint };
+export type { LogBlockPage };
 
 /**
- * Inclusive newest-first pages for the existing lookback window.
+ * Inclusive newest-first pages for the payment lookback.
+ * The window stays LOOKBACK_BLOCKS. Pages use MAX_GETLOGS_BLOCK_SPAN.
  * `latest > LOOKBACK_BLOCKS` starts at `latest - LOOKBACK_BLOCKS`; otherwise at 0.
- * Each page has `toBlock - fromBlock <= MAX_GETLOGS_BLOCK_SPAN`.
- * The next older page starts at `fromBlock - 1`, so every block is queried once.
+ * The next older page starts at `fromBlock - 1`.
  */
 export function lookbackLogPages(latest: bigint): LogBlockPage[] {
-  const windowStart = latest > LOOKBACK_BLOCKS ? latest - LOOKBACK_BLOCKS : 0n;
-  const pages: LogBlockPage[] = [];
-  let toBlock = latest;
-  while (toBlock >= windowStart) {
-    const fromBlock =
-      toBlock > windowStart + MAX_GETLOGS_BLOCK_SPAN
-        ? toBlock - MAX_GETLOGS_BLOCK_SPAN
-        : windowStart;
-    pages.push({ fromBlock, toBlock });
-    if (fromBlock === windowStart) break;
-    toBlock = fromBlock - 1n;
-  }
-  return pages;
+  return logBlockPages(latest, LOOKBACK_BLOCKS, MAX_GETLOGS_BLOCK_SPAN);
 }
 
 /** Legacy payment link. `version` omitted means V1. Identity is keccak256(utf8(memo)). */
