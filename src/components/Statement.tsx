@@ -1,15 +1,47 @@
 "use client";
 
+import { CancelLinkButton } from "@/components/CancelLinkButton";
 import { explorerTx, formatUsdc, shortAddr, shortHash } from "@/lib/format";
 import type { LedgerEntry } from "@/lib/ledger";
 import { readLinks } from "@/lib/payLinksLocal";
+import { cancelOffer, decodePayLink, paymentLinkPhase } from "@/lib/payRequest";
 import type { PayRecord } from "@/lib/payStore";
 import { useMounted } from "@/hooks/useMounted";
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { useAccount } from "wagmi";
 
-function linkStatus(row: PayRecord): { label: string; warn?: boolean } {
+function mergeRows(groups: PayRecord[][]): PayRecord[] {
+  const map = new Map<string, PayRecord>();
+  for (const group of groups) {
+    for (const row of group) map.set(row.token, row);
+  }
+  return [...map.values()].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+}
+
+async function recordsForTokens(tokens: string[]): Promise<PayRecord[]> {
+  const rows = await Promise.all(
+    tokens.map(async (token) => {
+      const res = await fetch(`/api/pay?token=${encodeURIComponent(token)}`);
+      if (!res.ok) return null;
+      const body = (await res.json()) as { record?: PayRecord };
+      return body.record ?? null;
+    }),
+  );
+  return rows.filter((row): row is PayRecord => row !== null);
+}
+
+function linkStatus(row: PayRecord, nowSeconds: number): { label: string; warn?: boolean } {
+  const link = decodePayLink(row.token);
+  if (link?.version === 2) {
+    const phase = paymentLinkPhase({
+      paid: Boolean(row.paidTx),
+      cancelled: row.cancelled,
+      expiresAt: link.request.expiresAt,
+      nowSeconds,
+    });
+    return { label: phase, warn: phase === "CANCELLED" || phase === "EXPIRED" };
+  }
   if (row.paidTx) return { label: "Paid" };
   if (row.cancelled) return { label: "Cancelled", warn: true };
   if (row.views > 0) return { label: `Viewed · ${row.views}` };
@@ -23,8 +55,8 @@ export function Statement() {
   const [payments, setPayments] = useState<LedgerEntry[]>([]);
   const [links, setLinks] = useState<PayRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
 
   const refresh = useCallback(async () => {
     if (!address) return;
@@ -50,9 +82,11 @@ export function Statement() {
         setError(body.error ?? "Could not load statement.");
         return;
       }
+      const remembered = await recordsForTokens(local);
       setError(null);
       setPayments(body.payments ?? []);
-      setLinks(body.links ?? []);
+      setLinks(mergeRows([body.links ?? [], remembered]));
+      setNowSeconds(Math.floor(Date.now() / 1000));
     } finally {
       setLoading(false);
     }
@@ -62,30 +96,11 @@ export function Statement() {
     if (connected) void refresh();
   }, [connected, refresh]);
 
-  async function cancel(token: string) {
-    if (!address) return;
-    setBusy(token);
-    try {
-      const res = await fetch("/api/pay", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ token, action: "cancel", address }),
-      });
-      if (!res.ok) {
-        const body = (await res.json()) as { error?: string };
-        setError(body.error ?? "Cancel failed.");
-      }
-      await refresh();
-    } finally {
-      setBusy(null);
-    }
-  }
-
   async function copy(token: string) {
     await navigator.clipboard.writeText(`${window.location.origin}/p/${token}`);
   }
 
-  if (!connected) {
+  if (!connected || !address) {
     return <p className="text-sm text-[var(--muted)]">Connect a wallet to read its Memo ledger on Arc.</p>;
   }
 
@@ -96,13 +111,20 @@ export function Statement() {
       {error ? <p className="text-sm text-[var(--stamp)]">{error}</p> : null}
 
       <section>
-        <h3 className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Open links</h3>
+        <h3 className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">Payment links</h3>
         {openLinks.length === 0 ? (
           <p className="mt-3 text-sm text-[var(--muted)]">None.</p>
         ) : (
           <div className="mt-3 flex flex-col gap-4">
             {openLinks.map((row) => {
-              const status = linkStatus(row);
+              const status = linkStatus(row, nowSeconds);
+              const offer = cancelOffer({
+                token: row.token,
+                address,
+                paid: Boolean(row.paidTx),
+                cancelled: row.cancelled,
+                nowSeconds,
+              });
               return (
                 <div key={row.token} className="border-b border-[var(--line)] pb-4">
                   <div className="flex items-start justify-between gap-3">
@@ -119,19 +141,17 @@ export function Statement() {
                       {status.label}
                     </p>
                   </div>
-                  <div className="mt-3 flex flex-wrap gap-3 text-sm">
+                  <div className="mt-3 flex flex-wrap items-center gap-3 text-sm">
                     <button type="button" className="underline" onClick={() => copy(row.token)}>
                       Copy link
                     </button>
-                    {!row.cancelled ? (
-                      <button
-                        type="button"
-                        className="underline text-[var(--stamp)]"
-                        disabled={busy === row.token}
-                        onClick={() => cancel(row.token)}
-                      >
-                        {busy === row.token ? "Cancelling…" : "Cancel"}
-                      </button>
+                    {offer ? (
+                      <CancelLinkButton
+                        token={row.token}
+                        mode={offer}
+                        onDone={refresh}
+                        onError={setError}
+                      />
                     ) : null}
                   </div>
                 </div>

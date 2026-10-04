@@ -2,7 +2,9 @@
 
 import { ARC_CHAIN_ID, USDC_ADDRESS, USDC_DECIMALS } from "@/lib/arc";
 import { explorerTx, formatUsdc } from "@/lib/format";
+import { assertV2Payable } from "@/lib/payRequest";
 import { sendMemoPayment } from "@/lib/sendMemo";
+import type { FinalRequest } from "@/lib/finalRequest";
 import { useMounted } from "@/hooks/useMounted";
 import { useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
@@ -18,9 +20,12 @@ import {
 export function SendForm({
   hideBalance = false,
   locked,
+  request,
 }: {
   hideBalance?: boolean;
   locked?: { to: string; amount: string; memo: string };
+  /** Original signed V2 request. Settlement must use this object, not the fields below. */
+  request?: FinalRequest;
 }) {
   const router = useRouter();
   const { address, chainId, isConnected } = useAccount();
@@ -29,6 +34,9 @@ export function SendForm({
   const [to, setTo] = useState(locked?.to ?? "");
   const [amount, setAmount] = useState(locked?.amount ?? "");
   const [memo, setMemo] = useState(locked?.memo ?? "");
+  const shownTo = request ? request.recipient : to;
+  const shownAmount = request ? formatUnits(request.amountBaseUnits, USDC_DECIMALS) : amount;
+  const shownMemo = request ? request.memo : memo;
   const [status, setStatus] = useState<string | null>(null);
   const [failHash, setFailHash] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -54,7 +62,10 @@ export function SendForm({
   const mounted = useMounted();
   const connected = mounted && isConnected;
   const onWrongChain = connected && chainId !== ARC_CHAIN_ID;
-  const frozen = Boolean(locked);
+  const frozen = Boolean(locked || request);
+  const requestExpired = request
+    ? Math.floor(Date.now() / 1000) >= request.expiresAt
+    : false;
 
   async function onSubmit(event: React.FormEvent) {
     event.preventDefault();
@@ -70,21 +81,44 @@ export function SendForm({
       return;
     }
 
+    if (request) {
+      try {
+        assertV2Payable({
+          expiresAt: request.expiresAt,
+          nowSeconds: Math.floor(Date.now() / 1000),
+        });
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : "Payment request has expired.");
+        return;
+      }
+    }
+
     setBusy(true);
     setStatus("Confirm in your wallet…");
-    const result = await sendMemoPayment({
-      publicClient,
-      walletClient,
-      account: address,
-      to,
-      amount,
-      memo,
-      tokenBalance: tokenBalance ?? 0n,
-      refetchBalance: async () => {
-        const next = await refetchBalance();
-        return { data: next.data };
-      },
-    });
+    const refreshBalance = async () => {
+      const next = await refetchBalance();
+      return { data: next.data };
+    };
+    const result = request
+      ? await sendMemoPayment({
+          publicClient,
+          walletClient,
+          account: address,
+          version: 2,
+          request,
+          tokenBalance: tokenBalance ?? 0n,
+          refetchBalance: refreshBalance,
+        })
+      : await sendMemoPayment({
+          publicClient,
+          walletClient,
+          account: address,
+          to,
+          amount,
+          memo,
+          tokenBalance: tokenBalance ?? 0n,
+          refetchBalance: refreshBalance,
+        });
     setBusy(false);
 
     if (result.ok) {
@@ -111,9 +145,15 @@ export function SendForm({
         <p className="text-sm text-[var(--muted)]">Connect a wallet on Arc to continue.</p>
       )}
 
+      {request ? (
+        <p className="text-sm text-[var(--muted)]">
+          V2 Arc USDC payment request. Expires {new Date(request.expiresAt * 1000).toLocaleString()}.
+          Your wallet sends the USDC. The merchant signature does not spend your funds.
+        </p>
+      ) : null}
       <Field
         label="To"
-        value={to}
+        value={shownTo}
         onChange={setTo}
         placeholder="0x…"
         mono
@@ -121,7 +161,7 @@ export function SendForm({
       />
       <Field
         label="Amount (USDC)"
-        value={amount}
+        value={shownAmount}
         onChange={setAmount}
         placeholder="0.10"
         mono
@@ -129,7 +169,7 @@ export function SendForm({
       />
       <Field
         label="Memo"
-        value={memo}
+        value={shownMemo}
         onChange={setMemo}
         placeholder="INV-1042 · rent · prize"
         readOnly={frozen}
@@ -138,12 +178,15 @@ export function SendForm({
 
       <button
         type="submit"
-        disabled={busy || !connected || onWrongChain}
+        disabled={busy || !connected || onWrongChain || requestExpired}
         className="mt-2 rounded-sm border border-[var(--ink)] bg-[var(--ink)] px-4 py-3 text-sm text-[var(--paper)] disabled:opacity-40"
       >
         {busy ? "Sending…" : frozen ? "Pay" : "Send through Memo"}
       </button>
 
+      {requestExpired ? (
+        <p className="text-sm text-[var(--stamp)]">This Arc USDC payment request has expired.</p>
+      ) : null}
       {onWrongChain ? (
         <p className="text-sm text-[var(--stamp)]">Wrong network. Switch to Arc (5042).</p>
       ) : null}

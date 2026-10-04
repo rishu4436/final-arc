@@ -6,21 +6,22 @@ import { addDecimal, CCTP_SOURCES, GAS_BUFFER_USDC, sourceByChainId } from "@/li
 import { sanitizeError } from "@/lib/errors";
 import { sendMemoPayment } from "@/lib/sendMemo";
 import { USDC_ADDRESS, USDC_DECIMALS } from "@/lib/arc";
+import type { FinalRequest } from "@/lib/finalRequest";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
-import { erc20Abi } from "viem";
+import { erc20Abi, formatUnits } from "viem";
 import { useAccount, usePublicClient, useSwitchChain, useWalletClient } from "wagmi";
 import { useReadContract } from "wagmi";
 
-export function CrossChainPay({
-  to,
-  amount,
-  memo,
-}: {
-  to: string;
-  amount: string;
-  memo: string;
-}) {
+export function CrossChainPay(
+  props:
+    | { version: 1; to: string; amount: string; memo: string }
+    | { version: 2; request: FinalRequest },
+) {
+  const request = props.version === 2 ? props.request : undefined;
+  const to = props.version === 2 ? props.request.recipient : props.to;
+  const amount = props.version === 2 ? formatUnits(props.request.amountBaseUnits, USDC_DECIMALS) : props.amount;
+  const memo = props.version === 2 ? props.request.memo : props.memo;
   const router = useRouter();
   const { address, chainId, connector } = useAccount();
   const { switchChainAsync } = useSwitchChain();
@@ -80,19 +81,30 @@ export function CrossChainPay({
         return;
       }
       setStatus("Sending Memo payment…");
-      const paid = await sendMemoPayment({
-        publicClient,
-        walletClient,
-        account: address,
-        to,
-        amount,
-        memo,
-        tokenBalance: tokenBalance ?? 0n,
-        refetchBalance: async () => {
-          const next = await refetchBalance();
-          return { data: next.data };
-        },
-      });
+      const refreshBalance = async () => {
+        const next = await refetchBalance();
+        return { data: next.data };
+      };
+      const paid = request
+        ? await sendMemoPayment({
+            publicClient,
+            walletClient,
+            account: address,
+            version: 2,
+            request,
+            tokenBalance: tokenBalance ?? 0n,
+            refetchBalance: refreshBalance,
+          })
+        : await sendMemoPayment({
+            publicClient,
+            walletClient,
+            account: address,
+            to,
+            amount,
+            memo,
+            tokenBalance: tokenBalance ?? 0n,
+            refetchBalance: refreshBalance,
+          });
       if (paid.ok) {
         router.push(`/r/${paid.hash}`);
         return;
@@ -108,7 +120,11 @@ export function CrossChainPay({
   return (
     <div className="flex flex-col gap-6">
       {onArc ? (
-        <SendForm hideBalance locked={{ to, amount, memo }} />
+        request ? (
+          <SendForm hideBalance request={request} />
+        ) : (
+          <SendForm hideBalance locked={{ to, amount, memo }} />
+        )
       ) : (
         <div className="flex flex-col gap-4">
           <p className="text-sm text-[var(--muted)]">

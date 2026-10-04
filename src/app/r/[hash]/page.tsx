@@ -15,10 +15,16 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
     return { title: "Receipt not found · Final" };
   }
   const { parsed } = result;
-  if (!parsed.isMemo) {
+  if (!parsed.memoEventValid) {
     return {
       title: "Not a Memo payment · Final",
-      description: "This Arc transaction did not go through the protocol Memo contract.",
+      description: "No valid Arc Memo event was found. A call to the Memo contract is not enough.",
+    };
+  }
+  if (!parsed.settlementValid || !parsed.transactionSucceeded) {
+    return {
+      title: "Settlement not verified · Final",
+      description: "A Memo event was found, but the exact USDC settlement was not established.",
     };
   }
   const title = `${formatUsdc(parsed.amount)} USDC · ${parsed.memo ?? "Memo"}`;

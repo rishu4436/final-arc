@@ -1,14 +1,34 @@
 "use client";
 
+import { CancelLinkButton } from "@/components/CancelLinkButton";
 import { explorerTx, formatUsdc, shortHash } from "@/lib/format";
 import { readLinks } from "@/lib/payLinksLocal";
+import { cancelOffer, decodePayLink, paymentLinkPhase } from "@/lib/payRequest";
 import type { PayRecord } from "@/lib/payStore";
 import { useMounted } from "@/hooks/useMounted";
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { useAccount } from "wagmi";
 
-function statusLabel(row: PayRecord): { label: string; warn?: boolean } {
+function mergeRows(groups: PayRecord[][]): PayRecord[] {
+  const map = new Map<string, PayRecord>();
+  for (const group of groups) {
+    for (const row of group) map.set(row.token, row);
+  }
+  return [...map.values()].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+}
+
+function statusLabel(row: PayRecord, nowSeconds: number): { label: string; warn?: boolean } {
+  const link = decodePayLink(row.token);
+  if (link?.version === 2) {
+    const phase = paymentLinkPhase({
+      paid: Boolean(row.paidTx),
+      cancelled: row.cancelled,
+      expiresAt: link.request.expiresAt,
+      nowSeconds,
+    });
+    return { label: phase, warn: phase === "CANCELLED" || phase === "EXPIRED" };
+  }
   if (row.paidTx) return { label: "Paid" };
   if (row.cancelled) return { label: "Cancelled", warn: true };
   if (row.views > 0) return { label: `Viewed · ${row.views}` };
@@ -21,7 +41,7 @@ export function HistoryList() {
   const connected = mounted && isConnected && Boolean(address);
   const [rows, setRows] = useState<PayRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
+  const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
 
   const refresh = useCallback(async () => {
     if (!address) return;
@@ -41,40 +61,32 @@ export function HistoryList() {
       setError(body.error ?? "Could not load history.");
       return;
     }
+    const remembered = (
+      await Promise.all(
+        local.map(async (token) => {
+          const item = await fetch(`/api/pay?token=${encodeURIComponent(token)}`);
+          if (!item.ok) return null;
+          const payload = (await item.json()) as { record?: PayRecord };
+          return payload.record ?? null;
+        }),
+      )
+    ).filter((row): row is PayRecord => row !== null);
     setError(null);
-    setRows(body.records ?? []);
+    setRows(mergeRows([body.records ?? [], remembered]));
+    setNowSeconds(Math.floor(Date.now() / 1000));
   }, [address]);
 
   useEffect(() => {
     if (connected) void refresh();
   }, [connected, refresh]);
 
-  async function cancel(token: string) {
-    if (!address) return;
-    setBusy(token);
-    try {
-      const res = await fetch("/api/pay", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ token, action: "cancel", address }),
-      });
-      if (!res.ok) {
-        const body = (await res.json()) as { error?: string };
-        setError(body.error ?? "Cancel failed.");
-      }
-      await refresh();
-    } finally {
-      setBusy(null);
-    }
-  }
-
   async function copy(token: string) {
     const url = `${window.location.origin}/p/${token}`;
     await navigator.clipboard.writeText(url);
   }
 
-  if (!connected) {
-    return <p className="text-sm text-[var(--muted)]">Connect the payee wallet to see payment links.</p>;
+  if (!connected || !address) {
+    return <p className="text-sm text-[var(--muted)]">Connect a wallet to see payment links.</p>;
   }
 
   if (rows.length === 0) {
@@ -85,7 +97,14 @@ export function HistoryList() {
     <div className="flex flex-col gap-4">
       {error ? <p className="text-sm text-[var(--stamp)]">{error}</p> : null}
       {rows.map((row) => {
-        const status = statusLabel(row);
+        const status = statusLabel(row, nowSeconds);
+        const offer = cancelOffer({
+          token: row.token,
+          address,
+          paid: Boolean(row.paidTx),
+          cancelled: row.cancelled,
+          nowSeconds,
+        });
         return (
           <div key={row.token} className="border-b border-[var(--line)] pb-4">
             <div className="flex items-start justify-between gap-3">
@@ -103,7 +122,7 @@ export function HistoryList() {
               {new Date(row.createdAt).toLocaleString()}
               {row.lastViewedAt ? ` · viewed ${new Date(row.lastViewedAt).toLocaleString()}` : ""}
             </p>
-            <div className="mt-3 flex flex-wrap gap-3 text-sm">
+            <div className="mt-3 flex flex-wrap items-center gap-3 text-sm">
               <button type="button" className="underline" onClick={() => copy(row.token)}>
                 Copy link
               </button>
@@ -117,15 +136,8 @@ export function HistoryList() {
                   </a>
                 </>
               ) : null}
-              {!row.paidTx && !row.cancelled ? (
-                <button
-                  type="button"
-                  className="underline text-[var(--stamp)]"
-                  disabled={busy === row.token}
-                  onClick={() => cancel(row.token)}
-                >
-                  {busy === row.token ? "Cancelling…" : "Cancel"}
-                </button>
+              {offer ? (
+                <CancelLinkButton token={row.token} mode={offer} onDone={refresh} onError={setError} />
               ) : null}
             </div>
           </div>

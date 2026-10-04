@@ -15,11 +15,13 @@ export function ReceiptCard({
 }) {
   const [copied, setCopied] = useState(false);
   const stamp =
-    parsed.status !== "success"
+    !parsed.transactionSucceeded
       ? "Reverted"
-      : parsed.isMemo
+      : parsed.settlementValid
         ? "Final"
-        : "Not Memo";
+        : parsed.memoEventValid
+          ? "Memo only"
+          : "Not Memo";
 
   async function copyLink() {
     try {
@@ -44,10 +46,18 @@ export function ReceiptCard({
       <div className="perforation mx-2 my-3" />
 
       <div className="px-6 pb-8 sm:px-8">
-        {!parsed.isMemo ? (
+        {!parsed.transactionSucceeded ? (
           <p className="mb-6 text-sm text-[var(--stamp)]">
-            This transaction did not go through Arc’s Memo contract. It is not a
-            Final payment receipt.
+            This transaction reverted. It is not a successful settlement.
+          </p>
+        ) : !parsed.memoEventValid ? (
+          <p className="mb-6 text-sm text-[var(--stamp)]">
+            No valid Memo event was found. A transaction sent to the Memo contract
+            is not, by itself, a Final payment.
+          </p>
+        ) : !parsed.settlementValid ? (
+          <p className="mb-6 text-sm text-[var(--stamp)]">
+            A Memo event was found, but it is not bound to an exact USDC transfer.
           </p>
         ) : null}
 
@@ -108,10 +118,13 @@ export function ReceiptCard({
             <div className="mt-3 space-y-2 text-sm">
               <p>
                 Height {certificate.height} · round {certificate.round} ·{" "}
-                {certCheck.signatureCount} validator signatures ·{" "}
+                {certCheck.signatureCount} validator signatures listed ·{" "}
                 <span className={certCheck.matched ? "text-[var(--ok)]" : "text-[var(--stamp)]"}>
-                  {certCheck.matched ? "hash matched" : "hash mismatch"}
+                  {certCheck.matched ? "block hash matched" : "block hash mismatch"}
                 </span>
+                {certCheck.signaturesCryptographicallyVerified
+                  ? ""
+                  : " · signatures not checked"}
               </p>
               <p className="mono break-all text-xs text-[var(--muted)]">{certificate.block_hash}</p>
               <p className="text-xs text-[var(--muted)]">{certCheck.note}</p>

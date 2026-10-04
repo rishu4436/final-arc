@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getAddress, isAddress } from "viem";
 import { loadMemoLedger } from "@/lib/ledger";
-import { findPaidTx } from "@/lib/payPaid";
+import { findSettlementProof, lookupFromRecord } from "@/lib/payPaid";
 import { listByPayee, markPaid } from "@/lib/payStore";
 
 export async function GET(request: Request) {
@@ -22,10 +22,13 @@ export async function GET(request: Request) {
 
   const openLinks = await Promise.all(
     links.map(async (row) => {
-      if (row.paidTx) return row;
+      if (row.paidTx || row.cancelled) return row;
+      const lookup = lookupFromRecord(row);
+      if (!lookup) return row;
       try {
-        const tx = await findPaidTx({ to: row.to, amount: row.amount, memo: row.memo });
-        if (tx) return (await markPaid(row.token, tx)) ?? { ...row, paidTx: tx };
+        const proof = await findSettlementProof(lookup);
+        if (!proof) return row;
+        return (await markPaid(row.token, proof)) ?? row;
       } catch {
         /* ignore */
       }
