@@ -30,5 +30,22 @@ npm test
 npm run dev
 ```
 
-USDC on Arc is required to send. Link views and cancels persist in `data/pay-store.json` locally, or in Redis when `KV_REST_API_URL` and `KV_REST_API_TOKEN` are set.
+USDC on Arc is required to send.
+
+## Payment store
+
+With no Redis credentials, FINAL stores payment links in `data/pay-store.json`. That file is local development persistence.
+
+Production should use one complete Redis REST pair:
+
+- `KV_REST_API_URL` and `KV_REST_API_TOKEN`
+- `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`
+
+If both pairs are complete, the KV pair is used. A URL from one pair is never combined with a token from the other. A pair missing either value is treated as absent.
+
+`FINAL_PAY_STORE`, when set, is the JSON file path and skips Redis. Leave it unset in production when Redis is intended. Set it only to force file storage.
+
+Once a Redis pair is active, a failed Redis read or write does not fall back to the JSON file. Payment-status reconciliation reports that infrastructure failure instead of treating the payment as unpaid.
+
+This repository does not record whether any deployed environment has those variables set.
 
