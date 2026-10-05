@@ -325,7 +325,8 @@ export function liveApiKeyRuntime(): ApiKeyRuntime {
     async touchLastUsed(id, iso) {
       await mutatePayStoreBlob((store) => {
         const current = asApiKeyRecord(ensureSection(store).keys[id]);
-        if (!current) return;
+        // P1-02: revoke/disable wins. Never resurrect a revoked or disabled key via lastUsedAt.
+        if (!current || current.revoked || !current.enabled) return;
         current.lastUsedAt = iso;
         ensureSection(store).keys[id] = current;
       });

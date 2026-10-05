@@ -112,7 +112,10 @@ function harness(scopes: readonly ApiScope[] = ["agent:read", "agent:write"]): H
       return verifyImpl(hash);
     },
     readBlob: async () => blob,
-    writeBlob: async () => undefined,
+    mutateBlob: async (mutator) => {
+      mutator(blob);
+      return blob;
+    },
     policyLedger: redisPolicyLedger({ url: "https://kv.fake", token: "t" }, createFakeRedis().fetch),
     emit: (input) => {
       events.push({ type: input.type });
@@ -649,8 +652,11 @@ test("intent writes keep payments, webhooks, api keys, and escrows", async () =>
   } satisfies PayRecord;
   const h = harness();
   h.deps.readBlob = async () => structuredClone(canonical);
-  h.deps.writeBlob = async (store) => {
-    canonical = store;
+  h.deps.mutateBlob = async (mutator) => {
+    const next = structuredClone(canonical);
+    mutator(next);
+    canonical = next;
+    return next;
   };
   h.deps.upsertRecord = async (record) => {
     const next = mergePayRecord(canonical.records[record.token], record);

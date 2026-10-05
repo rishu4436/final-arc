@@ -1,9 +1,11 @@
 import { LEDGER_CAS_SCRIPT } from "./policyLedger";
+import { PAY_STORE_CAS_SCRIPT } from "./payStoreCas";
 
 /**
  * Test-only in-memory stand-in for the Upstash/Vercel KV REST interface.
- * Supports GET /get/<key> and POST ["EVAL", LEDGER_CAS_SCRIPT, "1", key, expected, next]
+ * Supports GET /get/<key> and POST ["EVAL", <CAS script>, "1", key, expected, next]
  * with the same compare-and-set semantics the Lua script has inside Redis.
+ * Accepts both the policy-ledger and pay-store CAS scripts (identical Lua).
  * Each response yields to the event loop first so concurrent callers interleave.
  * Not a real Redis. No network.
  */
@@ -15,6 +17,8 @@ export type FakeRedis = {
   evalCalls: number;
   conflictsReturned: number;
 };
+
+const CAS_SCRIPTS = new Set([LEDGER_CAS_SCRIPT, PAY_STORE_CAS_SCRIPT]);
 
 function json(result: unknown): Response {
   return new Response(JSON.stringify({ result }), { status: 200, headers: { "content-type": "application/json" } });
@@ -39,7 +43,7 @@ export function createFakeRedis(): FakeRedis {
       }
       if ((init?.method ?? "GET") === "POST" && url.pathname === "/") {
         const command = JSON.parse(String(init?.body)) as string[];
-        if (command[0] !== "EVAL" || command[1] !== LEDGER_CAS_SCRIPT || command[2] !== "1") {
+        if (command[0] !== "EVAL" || !CAS_SCRIPTS.has(command[1]) || command[2] !== "1") {
           return new Response(JSON.stringify({ error: "unsupported" }), { status: 400 });
         }
         fake.evalCalls += 1;

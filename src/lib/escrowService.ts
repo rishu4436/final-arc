@@ -4,6 +4,7 @@ import { WALLET_ACTIONS, type ApiScope, type WalletAction } from "./apiScopes";
 import { liveEscrowChainPort, type EscrowChainPort } from "./escrowChain";
 import {
   applyEscrowTransition,
+  type EscrowState,
   arcChainId,
   checksumAddress,
   deriveEscrowId,
@@ -684,6 +685,24 @@ export async function cancelEscrow(request: Request, id: string, deps: EscrowDep
   return confirmSigned(loaded.row, deps, "cancel", "EscrowCancelled", body, (row) => getAddress(row.creator));
 }
 
+
+/** P1-02: only allow same-state field updates or forward transitions from the fresh blob. */
+function canPersistEscrowState(existing: EscrowState, incoming: EscrowState): boolean {
+  if (existing === incoming) return true;
+  if (existing === "RELEASED" || existing === "REFUNDED" || existing === "CANCELLED") return false;
+  const rank: Record<EscrowState, number> = {
+    CREATED: 0,
+    OPEN: 1,
+    FUNDED: 2,
+    RELEASED: 3,
+    REFUNDED: 3,
+    CANCELLED: 3,
+  };
+  if (rank[incoming] < rank[existing]) return false;
+  if (existing === "FUNDED" && incoming === "CANCELLED") return false;
+  return true;
+}
+
 function ensureSection(store: { escrows?: EscrowStoreSection }): EscrowStoreSection {
   if (!store.escrows || typeof store.escrows !== "object") store.escrows = { records: {} };
   if (!store.escrows.records || typeof store.escrows.records !== "object") store.escrows.records = {};
@@ -705,7 +724,13 @@ export function liveEscrowDeps(runtime: ApiKeyRuntime = liveApiKeyRuntime()): Es
     async save(row) {
       await mutatePayStoreBlob((store) => {
         const section = ensureSection(store);
-        section.records[row.escrowId.toLowerCase()] = row;
+        const key = row.escrowId.toLowerCase();
+        const existing = asEscrowRecord(section.records[key]);
+        if (existing && !canPersistEscrowState(existing.state, row.state)) {
+          // Stale writer must not regress FUNDED→CREATED or overwrite a terminal state.
+          return;
+        }
+        section.records[key] = row;
       });
     },
     emit(type, merchant, data) {

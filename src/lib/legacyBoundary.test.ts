@@ -585,8 +585,11 @@ test("P1-03: API key, webhook endpoint, and policy creation caps return 409 limi
   const policyDeps: PolicyDeps = {
     nowSeconds: () => NOW,
     readBlob: async () => structuredClone(blob),
-    writeBlob: async (next) => {
-      blob = structuredClone(next);
+    mutateBlob: async (mutator) => {
+      const next = structuredClone(blob);
+      mutator(next);
+      blob = next;
+      return next;
     },
     emit: () => {},
     apiKeyAuth: { ...keyRuntime([key.record]).runtime, rateLimitPerMinute: 10_000 },

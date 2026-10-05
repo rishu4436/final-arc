@@ -6,7 +6,6 @@ import { LIMIT_EXCEEDED_CODE, MAX_WEBHOOK_ENDPOINTS_PER_MERCHANT } from "./resou
 import {
   mutatePayStoreBlob,
   readPayStoreBlob,
-  writePayStoreBlob,
   type PayRecord,
   type WebhookStoreSection,
 } from "./payStore";
@@ -550,34 +549,38 @@ export async function updateWebhookEndpoint(
 ): Promise<{ status: number; body: (WebhookEndpointPublic & { secret?: string }) | WebhookApiError["body"] }> {
   try {
     const merchant = bindMerchant(input.merchant, deps, "not_found");
-    const store = await readPayStoreBlob();
-    const current = asEndpoint(section(store).endpoints[id]);
-    if (!current || !sameMerchant(current, merchant)) return notFound();
-
-    let url = current.url;
+    // Validate URL/events before CAS so retries reuse the same secret/fields.
+    let nextUrl: string | undefined;
     if (input.url !== undefined) {
       if (typeof input.url !== "string") {
         return webhookApiError(400, WEBHOOK_ERROR_CODES.invalidUrl, "Webhook URL must be an absolute https URL.");
       }
-      url = validateWebhookUrl(input.url);
+      nextUrl = validateWebhookUrl(input.url);
     }
-    let events = current.events;
-    if (input.events !== undefined) events = parseEventSubscriptions(input.events);
-    const enabled = input.enabled === undefined ? current.enabled : Boolean(input.enabled);
+    let nextEvents: WebhookEndpointRecord["events"] | undefined;
+    if (input.events !== undefined) nextEvents = parseEventSubscriptions(input.events);
     const rotate = input.rotateSecret === true;
-    const secret = rotate ? deps.createSecret() : current.secret;
-    const updated: WebhookEndpointRecord = {
-      ...current,
-      url,
-      events,
-      enabled,
-      secret,
-      updatedAt: new Date(deps.nowSeconds() * 1000).toISOString(),
-    };
-    section(store).endpoints[id] = updated;
-    await writePayStoreBlob(store);
+    const rotatedSecret = rotate ? deps.createSecret() : null;
+    let updated: WebhookEndpointRecord | null = null;
+    await mutatePayStoreBlob((store) => {
+      const current = asEndpoint(section(store).endpoints[id]);
+      // Delete wins: a concurrent delete leaves the endpoint missing.
+      if (!current || !sameMerchant(current, merchant)) {
+        throw new WebhookHttpError(404, WEBHOOK_ERROR_CODES.notFound, "Webhook endpoint not found.");
+      }
+      updated = {
+        ...current,
+        url: nextUrl ?? current.url,
+        events: nextEvents ?? current.events,
+        enabled: input.enabled === undefined ? current.enabled : Boolean(input.enabled),
+        secret: rotatedSecret ?? current.secret,
+        updatedAt: new Date(deps.nowSeconds() * 1000).toISOString(),
+      };
+      section(store).endpoints[id] = updated;
+    });
+    if (!updated) return notFound();
     const body: WebhookEndpointPublic & { secret?: string } = toPublicEndpoint(updated);
-    if (rotate) body.secret = secret;
+    if (rotate && rotatedSecret) body.secret = rotatedSecret;
     return { status: 200, body };
   } catch (err) {
     return asWebhookError(err);
@@ -591,11 +594,13 @@ export async function deleteWebhookEndpoint(
 ): Promise<{ status: number; body: { deleted: true } | WebhookApiError["body"] }> {
   try {
     const merchant = bindMerchant(merchantRaw, deps, "not_found");
-    const store = await readPayStoreBlob();
-    const current = asEndpoint(section(store).endpoints[id]);
-    if (!current || !sameMerchant(current, merchant)) return notFound();
-    delete section(store).endpoints[id];
-    await writePayStoreBlob(store);
+    await mutatePayStoreBlob((store) => {
+      const current = asEndpoint(section(store).endpoints[id]);
+      if (!current || !sameMerchant(current, merchant)) {
+        throw new WebhookHttpError(404, WEBHOOK_ERROR_CODES.notFound, "Webhook endpoint not found.");
+      }
+      delete section(store).endpoints[id];
+    });
     return { status: 200, body: { deleted: true } };
   } catch (err) {
     return asWebhookError(err);
@@ -826,13 +831,18 @@ export async function processDueWebhookDeliveries(
       continue;
     }
     // Mark prior slot consumed so a second processDue does not double-fire the same attempt.
-    section(store).deliveries[prior.deliveryId] = {
+    const consumed: WebhookDeliveryRecord = {
       ...prior,
       status: prior.attempt >= WEBHOOK_MAX_ATTEMPTS ? "failed" : "retrying",
       nextRetryAt: null,
       error: prior.error,
     };
-    await writePayStoreBlob(store);
+    section(store).deliveries[prior.deliveryId] = consumed;
+    await mutatePayStoreBlob((fresh) => {
+      const current = asDelivery(section(fresh).deliveries[prior.deliveryId]);
+      if (!current || current.status !== "retrying" || current.nextRetryAt !== prior.nextRetryAt) return;
+      section(fresh).deliveries[prior.deliveryId] = consumed;
+    });
     const nextAttempt = prior.attempt + 1;
     if (nextAttempt > WEBHOOK_MAX_ATTEMPTS) continue;
     out.push(await deliverOnce(endpoint, envelope, prior.body, nextAttempt, deps));

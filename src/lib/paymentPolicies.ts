@@ -3,7 +3,7 @@ import { getAddress, isAddress, type Address } from "viem";
 import { authorizeHttp, AUTH_MESSAGE, type ApiKeyRuntime, liveApiKeyRuntime } from "./apiKeys";
 import { WALLET_ACTIONS, type ApiScope, type WalletAction } from "./apiScopes";
 import { USDC_ADDRESS } from "./arc";
-import { readPayStoreBlob, writePayStoreBlob, type PolicyStoreSection, type StoreFile } from "./payStore";
+import { mutatePayStoreBlob, readPayStoreBlob, type PolicyStoreSection, type StoreFile } from "./payStore";
 import {
   evaluatePaymentPolicy,
   mergePolicyRules,
@@ -66,7 +66,8 @@ export type PolicyDenialRecord = {
 export type PolicyDeps = {
   nowSeconds: () => number;
   readBlob: () => Promise<StoreFile>;
-  writeBlob: (store: StoreFile) => Promise<void>;
+  /** CAS-backed mutation (P1-02). Process lock remains an in-process optimization only. */
+  mutateBlob: (mutator: (store: StoreFile) => void) => Promise<StoreFile>;
   emit: (input: { type: EmittableWebhookEvent; merchant: string; data: Record<string, unknown> }) => void;
   apiKeyAuth: ApiKeyRuntime;
 };
@@ -552,12 +553,16 @@ export async function createPolicy(request: Request, deps: PolicyDeps): Promise<
   };
   try {
     const limited = await withMerchantPolicyLock(auth.merchant, async () => {
-      const store = await deps.readBlob();
-      // Phase 13 (P1-03): per-merchant policy ceiling. Delete removes rows, so this never locks a merchant out.
-      if (policiesForMerchant(store, auth.merchant).length >= MAX_POLICIES_PER_MERCHANT) return true;
-      ensurePolicySection(store).records[policy.id] = policy;
-      await deps.writeBlob(store);
-      return false;
+      let hitLimit = false;
+      await deps.mutateBlob((store) => {
+        // Phase 13 (P1-03): per-merchant policy ceiling. Delete removes rows, so this never locks a merchant out.
+        if (policiesForMerchant(store, auth.merchant).length >= MAX_POLICIES_PER_MERCHANT) {
+          hitLimit = true;
+          return;
+        }
+        ensurePolicySection(store).records[policy.id] = policy;
+      });
+      return hitLimit;
     });
     if (limited) return error(409, LIMIT_EXCEEDED_CODE, "Policy limit reached for this merchant.");
   } catch {
@@ -606,37 +611,50 @@ export async function updatePolicy(request: Request, id: string, deps: PolicyDep
   try {
     let updated: PaymentPolicy | null = null;
     const failure = await withMerchantPolicyLock(auth.merchant, async () => {
-      const store = await deps.readBlob();
-      const current = ownedPolicy(store, id, auth.merchant);
-      if (!current) return error(404, "not_found", "Unknown policy.");
-      let name = current.name;
-      if (body.name !== undefined) {
-        const parsed = parseName(body.name);
-        if (isResult(parsed)) return parsed;
-        name = parsed;
-      }
-      let enabled = current.enabled;
-      if (body.enabled !== undefined) {
-        if (typeof body.enabled !== "boolean") return error(400, "invalid_request", "enabled must be a boolean.");
-        enabled = body.enabled;
-      }
-      let rules = current.rules;
-      if (body.rules !== undefined) {
-        const merged = mergePolicyRules(current.rules, body.rules);
-        if ("error" in merged) return error(400, "invalid_request", merged.error);
-        rules = merged;
-      }
-      updated = {
-        ...current,
-        name,
-        enabled,
-        rules,
-        updatedAt: new Date(deps.nowSeconds() * 1000).toISOString(),
-        version: POLICY_VERSION,
-      };
-      ensurePolicySection(store).records[current.id] = updated;
-      await deps.writeBlob(store);
-      return null;
+      let fail: PolicyResult | null = null;
+      await deps.mutateBlob((store) => {
+        const current = ownedPolicy(store, id, auth.merchant);
+        if (!current) {
+          fail = error(404, "not_found", "Unknown policy.");
+          return;
+        }
+        let name = current.name;
+        if (body.name !== undefined) {
+          const parsed = parseName(body.name);
+          if (isResult(parsed)) {
+            fail = parsed;
+            return;
+          }
+          name = parsed;
+        }
+        let enabled = current.enabled;
+        if (body.enabled !== undefined) {
+          if (typeof body.enabled !== "boolean") {
+            fail = error(400, "invalid_request", "enabled must be a boolean.");
+            return;
+          }
+          enabled = body.enabled;
+        }
+        let rules = current.rules;
+        if (body.rules !== undefined) {
+          const merged = mergePolicyRules(current.rules, body.rules);
+          if ("error" in merged) {
+            fail = error(400, "invalid_request", merged.error);
+            return;
+          }
+          rules = merged;
+        }
+        updated = {
+          ...current,
+          name,
+          enabled,
+          rules,
+          updatedAt: new Date(deps.nowSeconds() * 1000).toISOString(),
+          version: POLICY_VERSION,
+        };
+        ensurePolicySection(store).records[current.id] = updated;
+      });
+      return fail;
     });
     if (failure) return failure;
     if (!updated) return error(404, "not_found", "Unknown policy.");
@@ -651,12 +669,16 @@ export async function deletePolicy(request: Request, id: string, deps: PolicyDep
   if (!("ok" in auth)) return auth;
   try {
     const failure = await withMerchantPolicyLock(auth.merchant, async () => {
-      const store = await deps.readBlob();
-      const current = ownedPolicy(store, id, auth.merchant);
-      if (!current) return error(404, "not_found", "Unknown policy.");
-      delete ensurePolicySection(store).records[current.id];
-      await deps.writeBlob(store);
-      return null;
+      let fail: PolicyResult | null = null;
+      await deps.mutateBlob((store) => {
+        const current = ownedPolicy(store, id, auth.merchant);
+        if (!current) {
+          fail = error(404, "not_found", "Unknown policy.");
+          return;
+        }
+        delete ensurePolicySection(store).records[current.id];
+      });
+      return fail;
     });
     if (failure) return failure;
     return { status: 200, body: { deleted: true, id } };
@@ -669,7 +691,7 @@ export function livePolicyDeps(): PolicyDeps {
   return {
     nowSeconds: () => Math.floor(Date.now() / 1000),
     readBlob: readPayStoreBlob,
-    writeBlob: writePayStoreBlob,
+    mutateBlob: mutatePayStoreBlob,
     emit: (input) => {
       safeEmitWebhookEvent(input);
     },

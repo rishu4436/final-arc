@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { Address, Hash } from "viem";
-import { getRecord, markCancelled, markPaid, markViewed, upsertRecord, type PayRecord } from "./payStore";
+import { createFakeRedis } from "./fakeRedisRest";
+import { getRecord, markCancelled, markPaid, markViewed, mutatePayStoreBlob, upsertRecord, PAY_STORE_KEY, type PayRecord } from "./payStore";
 
 const ENV_KEYS = [
   "FINAL_PAY_STORE",
@@ -81,13 +82,21 @@ function kvBody(store: { records: Record<string, PayRecord> } | null, status = 2
 function decodeSet(body: string | undefined): { records: Record<string, PayRecord> } {
   assert.equal(typeof body, "string");
   const parsed = JSON.parse(body as string) as unknown;
-  // Command API: ["SET", "final-pay-store", "<json>"]
+  // P1-02 command API: ["EVAL", script, "1", "final-pay-store", expectedRaw, nextRaw]
+  if (Array.isArray(parsed) && parsed[0] === "EVAL" && typeof parsed[5] === "string") {
+    return JSON.parse(parsed[5]) as { records: Record<string, PayRecord> };
+  }
+  // Legacy unconditional SET: ["SET", "final-pay-store", "<json>"]
   if (Array.isArray(parsed) && parsed[0] === "SET" && typeof parsed[2] === "string") {
     return JSON.parse(parsed[2]) as { records: Record<string, PayRecord> };
   }
   // Legacy path-style body was JSON.stringify(JSON.stringify(store)).
   assert.equal(typeof parsed, "string");
   return JSON.parse(parsed as string) as { records: Record<string, PayRecord> };
+}
+
+function casOk(): Response {
+  return new Response(JSON.stringify({ result: 1 }), { status: 200, headers: { "content-type": "application/json" } });
 }
 
 async function withEnv(fn: () => Promise<void>): Promise<void> {
@@ -336,24 +345,25 @@ serial("Redis write network failure throws a generic error", () =>
 
 serial("a later upsert cannot clear paidTx that Redis has at write time", () =>
   withEnv(async () => {
-    process.env.KV_REST_API_URL = "https://kv.example.test";
-    process.env.KV_REST_API_TOKEN = "kv-token";
+    const redis = createFakeRedis();
+    process.env.KV_REST_API_URL = "https://kv.fake";
+    process.env.KV_REST_API_TOKEN = "token";
+    globalThis.fetch = redis.fetch as typeof fetch;
     const open = row();
-    const calls = installFetch((call, index) => {
-      if (call.method !== "GET") return new Response("{}", { status: 200 });
-      if (index === 0) return kvBody({ records: { tok: open } });
-      return kvBody({
-        records: {
-          tok: { ...open, paidTx: TX },
-          other: row({ token: "other", paidTx: TX_OTHER }),
-        },
-      });
+    redis.values.set(
+      PAY_STORE_KEY,
+      JSON.stringify({ records: { tok: open, other: row({ token: "other", paidTx: TX_OTHER }) } }),
+    );
+    // Concurrent settler marks paid while upsert retries after a forced conflict.
+    redis.injectConflicts(1);
+    const upsert = upsertRecord(row({ amount: "9.00", memo: "changed", paidTx: null }));
+    const settle = mutatePayStoreBlob((store) => {
+      const current = store.records.tok;
+      if (current && !current.paidTx) store.records.tok = { ...current, paidTx: TX };
     });
-    const saved = await upsertRecord(row({ amount: "9.00", memo: "changed", paidTx: null }));
-    assert.equal(saved.paidTx, TX);
-    assert.equal(saved.amount, "9.00");
-    const posted = calls.find((call) => call.method === "POST");
-    const stored = decodeSet(posted?.body);
+    await Promise.all([settle, upsert]);
+    const stored = JSON.parse(redis.values.get(PAY_STORE_KEY)!) as { records: Record<string, PayRecord> };
+    // Final blob must keep paidTx (and the unrelated paid row) regardless of interleaving.
     assert.equal(stored.records.tok?.paidTx, TX);
     assert.equal(stored.records.other?.paidTx, TX_OTHER);
   }),
@@ -361,26 +371,32 @@ serial("a later upsert cannot clear paidTx that Redis has at write time", () =>
 
 serial("an unrelated update cannot clear cancelled that Redis has at write time", () =>
   withEnv(async () => {
-    process.env.KV_REST_API_URL = "https://kv.example.test";
-    process.env.KV_REST_API_TOKEN = "kv-token";
+    const redis = createFakeRedis();
+    process.env.KV_REST_API_URL = "https://kv.fake";
+    process.env.KV_REST_API_TOKEN = "token";
+    globalThis.fetch = redis.fetch as typeof fetch;
     const open = row();
-    const calls = installFetch((call, index) => {
-      if (call.method !== "GET") return new Response("{}", { status: 200 });
-      if (index === 0) return kvBody({ records: { tok: open } });
-      return kvBody({
+    redis.values.set(
+      PAY_STORE_KEY,
+      JSON.stringify({
         records: {
-          tok: { ...open, cancelled: true, cancelledAt: "2026-02-02T00:00:00.000Z" },
+          tok: open,
           other: row({ token: "other", cancelled: true, cancelledAt: "2026-02-03T00:00:00.000Z" }),
         },
-      });
+      }),
+    );
+    redis.injectConflicts(1);
+    const view = markViewed("tok");
+    const cancel = mutatePayStoreBlob((store) => {
+      const current = store.records.tok;
+      if (current && !current.cancelled) {
+        store.records.tok = { ...current, cancelled: true, cancelledAt: "2026-02-02T00:00:00.000Z" };
+      }
     });
-    const viewed = await markViewed("tok");
-    assert.ok(viewed);
-    assert.equal(viewed.cancelled, true);
-    assert.equal(viewed.cancelledAt, "2026-02-02T00:00:00.000Z");
-    assert.equal(viewed.views, 1);
-    const stored = decodeSet(calls.find((call) => call.method === "POST")?.body);
+    await Promise.all([cancel, view]);
+    const stored = JSON.parse(redis.values.get(PAY_STORE_KEY)!) as { records: Record<string, PayRecord> };
     assert.equal(stored.records.tok?.cancelled, true);
+    assert.equal(stored.records.tok?.cancelledAt, "2026-02-02T00:00:00.000Z");
     assert.equal(stored.records.tok?.views, 1);
     assert.equal(stored.records.other?.cancelled, true);
   }),
@@ -393,7 +409,7 @@ serial("unpaid becomes paid through Redis", () =>
     const open = row();
     const calls = installFetch((call) => {
       if (call.method === "GET") return kvBody({ records: { tok: open } });
-      return new Response("{}", { status: 200 });
+      return casOk();
     });
     const paid = await markPaid("tok", { version: 1, tx: TX });
     assert.equal(paid?.paidTx, TX);
@@ -410,7 +426,7 @@ serial("open becomes cancelled through Redis", () =>
     const open = row();
     const calls = installFetch((call) => {
       if (call.method === "GET") return kvBody({ records: { tok: open } });
-      return new Response("{}", { status: 200 });
+      return casOk();
     });
     const cancelled = await markCancelled("tok", { version: 1, payee: PAYEE });
     assert.equal(cancelled?.cancelled, true);

@@ -139,7 +139,10 @@ function box(
     loadReceipt: async () => ({ error: "Transaction not found on Arc mainnet.", status: 404 }),
     verify: async (hash) => verifyImpl(hash),
     readBlob: async () => blob,
-    writeBlob: async () => undefined,
+    mutateBlob: async (mutator) => {
+      mutator(blob);
+      return blob;
+    },
     policyLedger: redisPolicyLedger({ url: "https://kv.fake", token: "t" }, redis.fetch),
     processLock: false,
     emit: (input) => emit(input),
@@ -147,7 +150,10 @@ function box(
   const policyDeps: PolicyDeps = {
     nowSeconds: () => clock,
     readBlob: async () => blob,
-    writeBlob: async () => undefined,
+    mutateBlob: async (mutator) => {
+      mutator(blob);
+      return blob;
+    },
     emit: (input) => emit(input),
     apiKeyAuth,
   };

@@ -1,6 +1,25 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { randomBytes } from "node:crypto";
 import type { Address, Hash } from "viem";
+import {
+  PAY_STORE_CAS_MAX_ATTEMPTS,
+  PAY_STORE_CAS_SCRIPT,
+  PAY_STORE_KEY,
+  PayStoreCasExhaustedError,
+  PayStoreMalformedError,
+  PayStoreUnavailableError,
+} from "./payStoreCas";
+
+export {
+  PAY_STORE_CAS_MAX_ATTEMPTS,
+  PAY_STORE_CAS_SCRIPT,
+  PAY_STORE_KEY,
+  PayStoreCasExhaustedError,
+  PayStoreMalformedError,
+  PayStoreUnavailableError,
+  isPayStorePersistenceError,
+} from "./payStoreCas";
 
 export type PayRecord = {
   token: string;
@@ -67,7 +86,8 @@ export type StoreFile = {
   policies?: PolicyStoreSection;
 };
 
-const KV_KEY = "final-pay-store";
+
+const KV_KEY = PAY_STORE_KEY;
 
 function completePair(urlName: string, tokenName: string): { url: string; token: string } | null {
   const url = process.env[urlName];
@@ -169,107 +189,10 @@ function preservePolicySection(current: StoreFile, outgoing: StoreFile): void {
   }
 }
 
-/** Missing key (result null) is an empty store. Anything else malformed is a failure. */
-function parseKvResult(result: unknown): StoreFile {
-  if (result == null) return { records: {} };
-  if (typeof result !== "string") throw new Error("Payment store read failed.");
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(result);
-    // Older writes used path-style SET with a JSON-string body and stored an
-    // extra quoted layer. Unwrap one accidental string so those blobs still load.
-    if (typeof parsed === "string") parsed = JSON.parse(parsed);
-  } catch {
-    throw new Error("Payment store read failed.");
-  }
-  if (!isStoreFile(parsed)) throw new Error("Payment store read failed.");
-  return parsed;
-}
-
-async function discardBody(res: Response): Promise<void> {
-  try {
-    await res.body?.cancel();
-  } catch {
-    // The status is enough. Never surface the body; it can echo the request.
-  }
-}
-
-async function readKv(creds: { url: string; token: string }): Promise<StoreFile> {
-  let res: Response;
-  try {
-    res = await fetch(`${creds.url}/get/${KV_KEY}`, {
-      headers: { Authorization: `Bearer ${creds.token}` },
-      cache: "no-store",
-    });
-  } catch {
-    throw new Error("Payment store read failed.");
-  }
-  if (!res.ok) {
-    await discardBody(res);
-    throw new Error(`Payment store read failed. HTTP ${res.status}`);
-  }
-  let body: unknown;
-  try {
-    body = await res.json();
-  } catch {
-    throw new Error("Payment store read failed.");
-  }
-  if (!body || typeof body !== "object" || Array.isArray(body) || !("result" in body)) {
-    throw new Error("Payment store read failed.");
-  }
-  return parseKvResult((body as { result?: unknown }).result);
-}
-
-async function writeKv(creds: { url: string; token: string }, store: StoreFile): Promise<void> {
-  // Use the Redis command API so the value is stored as one JSON string.
-  // Path-style /set with JSON.stringify(JSON.stringify(store)) double-encoded
-  // the blob and made every later read fail isStoreFile.
-  const value = JSON.stringify(store);
-  let res: Response;
-  try {
-    res = await fetch(creds.url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${creds.token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(["SET", KV_KEY, value]),
-    });
-  } catch {
-    throw new Error("Payment store write failed.");
-  }
-  if (!res.ok) {
-    await discardBody(res);
-    throw new Error(`Payment store write failed. HTTP ${res.status}`);
-  }
-  await discardBody(res);
-}
-
-async function readFileStore(): Promise<StoreFile> {
-  try {
-    const raw = await readFile(storePath(), "utf8");
-    const parsed = JSON.parse(raw) as StoreFile;
-    if (!parsed.records) return { records: {} };
-    return parsed;
-  } catch {
-    return { records: {} };
-  }
-}
-
-async function readStore(): Promise<StoreFile> {
-  const kv = kvCreds();
-  if (kv) return readKv(kv);
-  return readFileStore();
-}
-
 /**
- * Copy a stored paidTx or cancelled flag back onto the outgoing blob when
- * the outgoing row would clear it, including when the outgoing blob dropped
- * the row. Check-then-write, not compare-and-set: the Redis REST GET/SET
- * interface has no conditional write, and this re-read is not atomic with
- * the SET. A paidTx or cancellation that lands after this re-read can still
- * be overwritten. Two overlapping writers can still lose unpaid field
- * updates. A non-null paidTx can still be replaced by a different hash.
+ * Copy durable paid/cancelled flags from the snapshot the mutator started from.
+ * With CAS retries, a concurrent paid/cancel that lands after this snapshot causes
+ * a conflict and the mutator re-runs against the fresher blob.
  */
 function preserveDurableFlags(current: StoreFile, outgoing: StoreFile): void {
   for (const [token, stored] of Object.entries(current.records)) {
@@ -286,31 +209,224 @@ function preserveDurableFlags(current: StoreFile, outgoing: StoreFile): void {
   }
 }
 
-async function writeStore(store: StoreFile): Promise<void> {
-  const current = await readStore();
-  preserveDurableFlags(current, store);
-  preserveWebhookSection(current, store);
-  preserveApiKeySection(current, store);
-  preserveEscrowSection(current, store);
-  preserveAgentSection(current, store);
-  preservePolicySection(current, store);
-  const kv = kvCreds();
-  if (kv) {
-    await writeKv(kv, store);
-    return;
+function applySectionGuards(current: StoreFile, outgoing: StoreFile): void {
+  if (!outgoing.records || typeof outgoing.records !== "object" || Array.isArray(outgoing.records)) {
+    outgoing.records = { ...current.records };
   }
-  const path = storePath();
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(store), "utf8");
+  preserveDurableFlags(current, outgoing);
+  preserveWebhookSection(current, outgoing);
+  preserveApiKeySection(current, outgoing);
+  preserveEscrowSection(current, outgoing);
+  preserveAgentSection(current, outgoing);
+  preservePolicySection(current, outgoing);
+}
+
+async function discardBody(res: Response): Promise<void> {
+  try {
+    await res.body?.cancel();
+  } catch {
+    // The status is enough. Never surface the body; it can echo the request.
+  }
 }
 
 /**
- * Whole-store read/modify/write (one JSON blob, or one Redis key).
- * Two writers can both read the same snapshot and the later write wins.
- * That race is not atomic. These helpers only define the single-writer
- * transition. They do not claim compare-and-swap. writeStore re-reads and
- * refuses to clear paidTx or cancelled, but that check is not atomic either.
+ * Parse a Redis GET result into a store + the exact raw string used as the CAS token.
+ * Missing key (null) → empty store with expectedRaw "". Malformed → fail closed (no wipe).
  */
+function parseKvRaw(result: unknown): { store: StoreFile; raw: string } {
+  if (result == null) return { store: { records: {} }, raw: "" };
+  if (typeof result !== "string") throw new PayStoreMalformedError("Payment store read failed.");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result);
+    // Older writes used path-style SET with a JSON-string body and stored an
+    // extra quoted layer. Unwrap one accidental string so those blobs still load.
+    if (typeof parsed === "string") parsed = JSON.parse(parsed);
+  } catch {
+    throw new PayStoreMalformedError("Payment store read failed.");
+  }
+  if (!isStoreFile(parsed)) throw new PayStoreMalformedError("Payment store read failed.");
+  return { store: parsed, raw: result };
+}
+
+async function readKvRaw(creds: { url: string; token: string }): Promise<{ store: StoreFile; raw: string }> {
+  let res: Response;
+  try {
+    res = await fetch(`${creds.url}/get/${KV_KEY}`, {
+      headers: { Authorization: `Bearer ${creds.token}` },
+      cache: "no-store",
+    });
+  } catch {
+    throw new PayStoreUnavailableError("Payment store read failed.");
+  }
+  if (!res.ok) {
+    await discardBody(res);
+    throw new PayStoreUnavailableError(`Payment store read failed. HTTP ${res.status}`);
+  }
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    throw new PayStoreUnavailableError("Payment store read failed.");
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body) || !("result" in body)) {
+    throw new PayStoreUnavailableError("Payment store read failed.");
+  }
+  return parseKvRaw((body as { result?: unknown }).result);
+}
+
+async function casKv(creds: { url: string; token: string }, expectedRaw: string, nextRaw: string): Promise<boolean> {
+  let res: Response;
+  try {
+    res = await fetch(creds.url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${creds.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(["EVAL", PAY_STORE_CAS_SCRIPT, "1", KV_KEY, expectedRaw, nextRaw]),
+    });
+  } catch {
+    throw new PayStoreUnavailableError("Payment store write failed.");
+  }
+  if (!res.ok) {
+    await discardBody(res);
+    throw new PayStoreUnavailableError(`Payment store write failed. HTTP ${res.status}`);
+  }
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    throw new PayStoreUnavailableError("Payment store write failed.");
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body) || !("result" in body)) {
+    throw new PayStoreUnavailableError("Payment store write failed.");
+  }
+  const result = (body as { result: unknown }).result;
+  return result === 1 || result === "1";
+}
+
+/** Process-local serialization for the file backend. Not multi-instance safe. */
+const fileTails = new Map<string, Promise<unknown>>();
+
+function serializeFile<T>(path: string, task: () => Promise<T>): Promise<T> {
+  const previous = fileTails.get(path) ?? Promise.resolve();
+  const run = previous.then(task, task);
+  fileTails.set(
+    path,
+    run.then(
+      () => undefined,
+      () => undefined,
+    ),
+  );
+  return run;
+}
+
+async function readFileRaw(): Promise<{ store: StoreFile; raw: string }> {
+  const path = storePath();
+  try {
+    const raw = await readFile(path, "utf8");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new PayStoreMalformedError("Payment store read failed.");
+    }
+    if (!isStoreFile(parsed)) throw new PayStoreMalformedError("Payment store read failed.");
+    return { store: parsed, raw };
+  } catch (err) {
+    if (err instanceof PayStoreMalformedError) throw err;
+    if ((err as { code?: string }).code === "ENOENT") return { store: { records: {} }, raw: "" };
+    // Legacy: a missing/unreadable local file is an empty store for first boot.
+    // Any other I/O error fails closed rather than wiping Redis-shaped state.
+    if (err instanceof SyntaxError) throw new PayStoreMalformedError("Payment store read failed.");
+    throw new PayStoreUnavailableError("Payment store read failed.");
+  }
+}
+
+async function casFile(expectedRaw: string, nextRaw: string): Promise<boolean> {
+  const path = storePath();
+  return serializeFile(path, async () => {
+    let current = "";
+    try {
+      current = await readFile(path, "utf8");
+    } catch (err) {
+      if ((err as { code?: string }).code !== "ENOENT") {
+        throw new PayStoreUnavailableError("Payment store write failed.");
+      }
+    }
+    if (current !== expectedRaw) return false;
+    await mkdir(dirname(path), { recursive: true });
+    const tmp = `${path}.${randomBytes(8).toString("hex")}.tmp`;
+    try {
+      await writeFile(tmp, nextRaw, "utf8");
+      await rename(tmp, path);
+    } catch {
+      try {
+        await writeFile(path, nextRaw, "utf8");
+      } catch {
+        throw new PayStoreUnavailableError("Payment store write failed.");
+      }
+    }
+    return true;
+  });
+}
+
+async function readRaw(): Promise<{ store: StoreFile; raw: string }> {
+  const kv = kvCreds();
+  if (kv) return readKvRaw(kv);
+  return readFileRaw();
+}
+
+async function casCommit(expectedRaw: string, nextRaw: string): Promise<boolean> {
+  const kv = kvCreds();
+  if (kv) return casKv(kv, expectedRaw, nextRaw);
+  return casFile(expectedRaw, nextRaw);
+}
+
+async function readStore(): Promise<StoreFile> {
+  const { store } = await readRaw();
+  return store;
+}
+
+function cloneStore(store: StoreFile): StoreFile {
+  return JSON.parse(JSON.stringify(store)) as StoreFile;
+}
+
+/**
+ * Atomic read/modify/write for the shared pay-store blob (P1-02).
+ *
+ * Redis: Lua EVAL compare-and-set on the exact previous raw value.
+ * File: process-local CAS only — not safe across multiple Node processes.
+ *
+ * The mutator must be pure (no external side effects). On conflict the latest
+ * raw value is re-read and the mutator runs again (up to PAY_STORE_CAS_MAX_ATTEMPTS).
+ * Exhaustion and backend failures fail closed — never an unconditional SET.
+ */
+export async function mutatePayStoreBlob(mutator: (store: StoreFile) => void): Promise<StoreFile> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= PAY_STORE_CAS_MAX_ATTEMPTS; attempt += 1) {
+    const { store, raw } = await readRaw();
+    const next = cloneStore(store);
+    mutator(next);
+    applySectionGuards(store, next);
+    const nextRaw = JSON.stringify(next);
+    // Identical payload: nothing to write (avoids no-op CAS on missing-row reads).
+    if (nextRaw === raw) return next;
+    try {
+      const ok = await casCommit(raw, nextRaw);
+      if (ok) return next;
+    } catch (err) {
+      lastError = err;
+      if (err instanceof PayStoreUnavailableError || err instanceof PayStoreMalformedError) throw err;
+      throw err;
+    }
+  }
+  if (lastError) throw lastError;
+  throw new PayStoreCasExhaustedError();
+}
+
+
 export type PayPhase = "OPEN" | "VIEWED" | "PAID" | "CANCELLED" | "EXPIRED";
 
 /**
@@ -424,12 +540,15 @@ export function nextCancelledRecord(row: PayRecord, cancelledAt: string, command
   return { ...row, cancelled: true, cancelledAt };
 }
 
+
 export async function upsertRecord(record: PayRecord): Promise<PayRecord> {
-  const store = await readStore();
-  const existing = store.records[record.token];
-  store.records[record.token] = mergePayRecord(existing, record);
-  await writeStore(store);
-  return store.records[record.token];
+  let saved: PayRecord = record;
+  await mutatePayStoreBlob((store) => {
+    const existing = store.records[record.token];
+    saved = mergePayRecord(existing, record);
+    store.records[record.token] = saved;
+  });
+  return saved;
 }
 
 export async function getRecord(token: string): Promise<PayRecord | null> {
@@ -446,13 +565,18 @@ export async function listByPayee(to: Address): Promise<PayRecord[]> {
 }
 
 export async function markViewed(token: string): Promise<PayRecord | null> {
-  const store = await readStore();
-  const row = store.records[token];
-  if (!row) return null;
-  row.views += 1;
-  row.lastViewedAt = new Date().toISOString();
-  await writeStore(store);
-  return row;
+  let result: PayRecord | null = null;
+  await mutatePayStoreBlob((store) => {
+    const row = store.records[token];
+    if (!row) {
+      result = null;
+      return;
+    }
+    row.views += 1;
+    row.lastViewedAt = new Date().toISOString();
+    result = row;
+  });
+  return result;
 }
 
 /**
@@ -461,32 +585,55 @@ export async function markViewed(token: string): Promise<PayRecord | null> {
  * caller already checked. This function does not recover a signature.
  */
 export async function markCancelled(token: string, command: CancelCommand): Promise<PayRecord | null> {
-  const store = await readStore();
-  const row = store.records[token];
-  if (!row) return null;
-  if (command.version === 1) {
-    if (row.to.toLowerCase() !== command.payee.toLowerCase()) return null;
-  } else if (!isV2RequestId(row.id) || !sameId(row.id, command.requestId)) {
-    return null;
-  }
-  const next = nextCancelledRecord(row, new Date().toISOString(), command);
-  if (next === row) return row;
-  store.records[token] = next;
-  await writeStore(store);
-  return next;
+  let result: PayRecord | null = null;
+  await mutatePayStoreBlob((store) => {
+    const row = store.records[token];
+    if (!row) {
+      result = null;
+      return;
+    }
+    if (command.version === 1) {
+      if (row.to.toLowerCase() !== command.payee.toLowerCase()) {
+        result = null;
+        return;
+      }
+    } else if (!isV2RequestId(row.id) || !sameId(row.id, command.requestId)) {
+      result = null;
+      return;
+    }
+    const next = nextCancelledRecord(row, new Date().toISOString(), command);
+    if (next === row) {
+      result = row;
+      return;
+    }
+    store.records[token] = next;
+    result = next;
+  });
+  return result;
 }
 
-/** Refuses a V2 hash that did not come with the verified request identity. */
+/** Refuses a V2 hash that did not come with the verified request identity. Persistence only — does not change reconciliation. */
 export async function markPaid(token: string, proof: PaidProof): Promise<PayRecord | null> {
-  const store = await readStore();
-  const row = store.records[token];
-  if (!row) return null;
-  const next = nextPaidRecord(row, proof);
-  if (!next) return null;
-  if (next === row) return row;
-  store.records[token] = next;
-  await writeStore(store);
-  return next;
+  let result: PayRecord | null = null;
+  await mutatePayStoreBlob((store) => {
+    const row = store.records[token];
+    if (!row) {
+      result = null;
+      return;
+    }
+    const next = nextPaidRecord(row, proof);
+    if (!next) {
+      result = null;
+      return;
+    }
+    if (next === row) {
+      result = row;
+      return;
+    }
+    store.records[token] = next;
+    result = next;
+  });
+  return result;
 }
 
 /**
@@ -498,22 +645,30 @@ export async function listRecords(): Promise<PayRecord[]> {
   return Object.values(store.records);
 }
 
-
 /**
- * Full blob for webhook infrastructure. Payment helpers keep using readStore/writeStore.
+ * Full blob for webhook infrastructure and other section readers.
  * Callers must not put webhook secrets on PayRecord or return this blob from /api/pay.
  */
 export async function readPayStoreBlob(): Promise<StoreFile> {
   return readStore();
 }
 
+/**
+ * @deprecated Prefer mutatePayStoreBlob. Full-blob replacement from a caller-held
+ * snapshot is unsafe under concurrency. Kept only so test doubles that still
+ * inject writeBlob can be migrated; live paths must not use this for Redis writes.
+ *
+ * Implementation: CAS-mutates by copying each provided section onto a fresh clone.
+ * Concurrent updates to keys the caller omitted inside a section can still be lost
+ * if the caller passed a stale section map — callers should use mutatePayStoreBlob.
+ */
 export async function writePayStoreBlob(store: StoreFile): Promise<void> {
-  await writeStore(store);
-}
-
-export async function mutatePayStoreBlob(mutator: (store: StoreFile) => void): Promise<StoreFile> {
-  const store = await readStore();
-  mutator(store);
-  await writeStore(store);
-  return store;
+  await mutatePayStoreBlob((current) => {
+    current.records = store.records;
+    if (store.webhooks !== undefined) current.webhooks = store.webhooks;
+    if (store.apiKeys !== undefined) current.apiKeys = store.apiKeys;
+    if (store.escrows !== undefined) current.escrows = store.escrows;
+    if (store.agents !== undefined) current.agents = store.agents;
+    if (store.policies !== undefined) current.policies = store.policies;
+  });
 }

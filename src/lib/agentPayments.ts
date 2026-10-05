@@ -19,7 +19,7 @@ import {
   liveDeveloperApiDeps,
 } from "./developerApi";
 import { deriveMemoId, type FinalRequest } from "./finalRequest";
-import { readPayStoreBlob, writePayStoreBlob, type AgentStoreSection, type StoreFile } from "./payStore";
+import { mutatePayStoreBlob, readPayStoreBlob, type AgentStoreSection, type StoreFile } from "./payStore";
 import {
   decideMachinePolicy,
   enabledPolicies,
@@ -167,7 +167,8 @@ export type AgentChainProof = {
 export type AgentPaymentsDeps = DeveloperApiDeps & {
   verify: (hash: string) => Promise<AgentChainProof>;
   readBlob: () => Promise<StoreFile>;
-  writeBlob: (store: StoreFile) => Promise<void>;
+  /** CAS-backed section mutation (P1-02). Prefer this over a full-blob write. */
+  mutateBlob: (mutator: (store: StoreFile) => void) => Promise<StoreFile>;
   /** Atomic spend-cap reservation ledger (Phase 11.1). Separate from the blob. */
   policyLedger: PolicyLedger;
   /** In-process serialization is an optimization only; tests turn it off to model separate instances. */
@@ -506,10 +507,17 @@ function remember(
 }
 
 /**
- * Re-read the blob before writing so a payment, webhook, key, or escrow update
- * that landed after the first read is not replaced by a stale snapshot.
- * Only the intent and idempotency keys touched here are copied onto the fresh blob.
+ * Apply only the touched intent / idempotency / denial keys onto a fresh CAS snapshot.
+ * VERIFIED never downgrades. Existing idempotency rows win (first commit wins).
  */
+function mergeAgentIntent(existing: unknown, incoming: unknown): unknown {
+  const cur = readIntent(existing);
+  const next = readIntent(incoming);
+  if (!next) return existing;
+  if (cur?.status === "VERIFIED" && next.status !== "VERIFIED") return cur;
+  return next;
+}
+
 async function persistTouched(
   deps: AgentPaymentsDeps,
   source: StoreFile,
@@ -517,18 +525,26 @@ async function persistTouched(
   idempotencyIds: string[],
   policyTouch?: { reservations?: string[]; denials?: string[] },
 ): Promise<void> {
-  const fresh = await deps.readBlob();
-  if (fresh !== source) {
-    const from = readSection(source);
+  const from = readSection(source);
+  const reservations = policyTouch?.reservations ?? [];
+  const denials = policyTouch?.denials ?? [];
+  await deps.mutateBlob((fresh) => {
     const to = writeSection(fresh);
     for (const id of intentIds) {
-      if (from.intents[id] !== undefined) to.intents[id] = from.intents[id];
+      if (from.intents[id] !== undefined) {
+        to.intents[id] = mergeAgentIntent(to.intents[id], from.intents[id]);
+      }
     }
     for (const id of idempotencyIds) {
-      if (from.idempotency[id] !== undefined) to.idempotency[id] = from.idempotency[id];
+      if (from.idempotency[id] === undefined) continue;
+      const existing = readIdempotency(to.idempotency[id]);
+      const incoming = readIdempotency(from.idempotency[id]);
+      if (!incoming) continue;
+      // First committed idempotency row wins across CAS retries / concurrent writers.
+      if (!existing) {
+        to.idempotency[id] = from.idempotency[id];
+      }
     }
-    const reservations = policyTouch?.reservations ?? [];
-    const denials = policyTouch?.denials ?? [];
     if ((reservations.length > 0 || denials.length > 0) && source.policies) {
       if (!fresh.policies) fresh.policies = { records: {}, reservations: {}, denials: {} };
       if (!fresh.policies.records) fresh.policies.records = {};
@@ -536,17 +552,18 @@ async function persistTouched(
       if (!fresh.policies.denials) fresh.policies.denials = {};
       for (const id of reservations) {
         const row = source.policies.reservations?.[id];
-        if (row !== undefined) fresh.policies.reservations[id] = row;
+        if (row !== undefined && fresh.policies.reservations[id] === undefined) {
+          fresh.policies.reservations[id] = row;
+        }
       }
       for (const id of denials) {
         const row = source.policies.denials?.[id];
-        if (row !== undefined) fresh.policies.denials[id] = row;
+        if (row !== undefined && fresh.policies.denials[id] === undefined) {
+          fresh.policies.denials[id] = row;
+        }
       }
     }
-    await deps.writeBlob(fresh);
-    return;
-  }
-  await deps.writeBlob(source);
+  });
 }
 
 function lookupIdempotency(
@@ -1023,7 +1040,7 @@ export function liveAgentPaymentsDeps(authorization: string | null = null): Agen
     ...liveDeveloperApiDeps(authorization),
     verify: defaultVerify,
     readBlob: readPayStoreBlob,
-    writeBlob: writePayStoreBlob,
+    mutateBlob: mutatePayStoreBlob,
     policyLedger: livePolicyLedger(),
     emit: (input) => {
       safeEmitWebhookEvent(input);
