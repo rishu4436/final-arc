@@ -52,8 +52,13 @@ function errorMessage(body: unknown): string {
 
 function toneClass(status: string): string {
   if (status === "success" || status === "Enabled") return "text-[var(--ok)]";
-  if (status === "retrying") return "text-[var(--ink)]";
   return "text-[var(--stamp)]";
+}
+
+/** Display-only label. Persisted API status is unchanged. */
+function deliveryStatusLabel(status: string): string {
+  if (status === "retrying") return "Failed — automatic retries coming soon";
+  return status;
 }
 
 export function WebhooksPanel() {
@@ -266,9 +271,9 @@ export function WebhooksPanel() {
     <section className="mt-12 border-t border-[var(--line)] pt-8">
       <h2 className="display text-2xl">Webhooks</h2>
       <p className="mt-3 text-sm text-[var(--muted)]">
-        Endpoints for this connected wallet. Each change asks the wallet to sign a short-lived authorization. Delivery
-        is at-least-once. Consumers must deduplicate by <span className="mono">eventId</span>. Secrets are shown only
-        once on create or rotate.
+        Endpoints for this connected wallet. Each change asks the wallet to sign a short-lived authorization. Failed
+        deliveries are recorded. Automatic background retries are coming soon. Deduplicate webhook events by{" "}
+        <span className="mono">eventId</span>. Secrets are shown only once on create or rotate.
       </p>
       {error ? <p className="mt-3 text-sm text-[var(--stamp)]">{error}</p> : null}
       {onceSecret ? (
@@ -390,7 +395,9 @@ export function WebhooksPanel() {
               {deliveries.map((d) => (
                 <li key={d.deliveryId} className="py-3 text-sm">
                   <div className="flex flex-wrap items-center gap-3">
-                    <span className={`text-xs uppercase tracking-[0.14em] ${toneClass(d.status)}`}>{d.status}</span>
+                    <span className={`text-xs uppercase tracking-[0.14em] ${toneClass(d.status)}`}>
+                      {deliveryStatusLabel(d.status)}
+                    </span>
                     <span className="mono text-xs">{d.eventType}</span>
                     <span className="text-[var(--muted)]">attempt {d.attempt}</span>
                     {d.httpStatus != null ? <span className="text-[var(--muted)]">HTTP {d.httpStatus}</span> : null}

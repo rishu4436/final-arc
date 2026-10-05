@@ -504,8 +504,14 @@ export function AnalyticsPanel() {
               <Row label="Success rate" value={pct(w.deliveries.successRate)} />
               <Row label="Successful" value={String(w.deliveries.success)} tone="ok" />
               <Row label="Failed" value={String(w.deliveries.failed)} tone={w.deliveries.failed > 0 ? "stamp" : undefined} />
-              <Row label="Retrying" value={String(w.deliveries.retrying)} />
-              <Row label="Retry attempts" value={String(w.deliveries.retryAttempts)} />
+              <Row
+                label="Failed pending (retries coming soon)"
+                value={String(w.deliveries.retrying)}
+              />
+              <Row
+                label="Retry attempts (coming soon)"
+                value={String(w.deliveries.retryAttempts)}
+              />
             </ul>
             <ul>
               <Row label="Endpoints enabled" value={`${w.endpoints.enabled} / ${w.endpoints.total}`} />

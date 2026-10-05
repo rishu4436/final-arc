@@ -95,10 +95,9 @@ export default function DeveloperApiPage() {
           expired on GET, and it never emits <span className="mono">payment.*</span> until reconciliation exists.
         </p>
         <p className="mt-3 text-sm text-[var(--muted)]">
-          Delivery is at-least-once, not exactly-once. Retries reuse the same <span className="mono">eventId</span> and
-          create a new <span className="mono">deliveryId</span>. Max 5 attempts with exponential backoff (60s, 5m, 15m,
-          1h). Consumers must deduplicate by <span className="mono">eventId</span>. Webhook failure never changes payment
-          state.
+          FINAL makes one delivery attempt per event and records the result. Automatic retries are coming soon. Planned
+          retry policy: up to 5 attempts at 60s, 5m, 15m, and 1h, reusing the same <span className="mono">eventId</span>.
+          Deduplicate by <span className="mono">eventId</span>. Webhook failure never changes payment state.
         </p>
         <p className="mt-3 text-sm text-[var(--muted)]">
           URL rules: absolute https only. No credentials in the URL. Localhost, private IPv4, link-local, and common
