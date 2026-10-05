@@ -25,6 +25,7 @@ import { payRecordIdentity } from "./payPaid";
 import { decodePayLink, paymentLinkPhase, sealSignedV2Request, type PayLinkPhase } from "./payRequest";
 import { isTxHash } from "./receipt";
 import { getRecord, listRecords, upsertRecord, type PayRecord } from "./payStore";
+import { LIMIT_EXCEEDED_CODE, MAX_PAYMENT_RECORDS_PER_MERCHANT, countPayRecordsOwnedBy } from "./resourceLimits";
 import { emitPaymentRequestCreated } from "./webhooks";
 
 /**
@@ -543,6 +544,18 @@ export async function createPaymentRequest(
       existed = (await getRecord(sealed.token)) != null;
     } catch {
       fail(503, API_ERROR_CODES.storeUnavailable, "Payment store is unavailable.");
+    }
+    if (!existed) {
+      // Phase 13 (P1-03): per-merchant stored-row ceiling, same constant as legacy registration.
+      let owned: number;
+      try {
+        owned = countPayRecordsOwnedBy(await deps.listRecords(), sealed.request.merchant);
+      } catch {
+        fail(503, API_ERROR_CODES.storeUnavailable, "Payment store is unavailable.");
+      }
+      if (owned >= MAX_PAYMENT_RECORDS_PER_MERCHANT) {
+        fail(409, LIMIT_EXCEEDED_CODE, "Payment request limit reached for this merchant.");
+      }
     }
     let row: PayRecord;
     try {

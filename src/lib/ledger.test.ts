@@ -116,8 +116,12 @@ function idleDeps(): PayStatusDeps {
     markViewed: async () => null,
     upsertRecord: async (record) => record,
     findSettlementProof: async () => null,
-    notifyWebhook: async () => {},
     loadMemoLedger,
+    // Phase 13: /api/statement requires the authenticated merchant to equal the address.
+    authorize: async () => ({ ok: true as const, merchant: ACCOUNT }),
+    countOwnedRecords: async () => 0,
+    rateLimit: () => true,
+    clientKey: () => "ip:test",
   };
 }
 

@@ -115,8 +115,14 @@ function deps(options: {
       calls.find += 1;
       return find(lookup);
     },
-    async notifyWebhook() {},
     loadMemoLedger: options.ledger ?? (async () => []),
+    // Phase 13: legacy merchant reads/V1 register require auth. These fixtures act as the payee.
+    authorize: async () => ({ ok: true as const, merchant: MERCHANT }),
+    countOwnedRecords: async () => 0,
+    rateLimit: () => true,
+    clientKey: () => "ip:test",
+    emitCreated: () => {},
+    emitCancelled: () => {},
   };
   return { store, calls, current: (token: string) => records.get(token) ?? null };
 }
@@ -255,20 +261,24 @@ test("a thrown provider error is not copied into the response", async () => {
   );
 });
 
-test("register and view return 503 when settlement lookup throws", async () => {
+// Phase 13 (P1-05): register and view no longer reach reconciliation, so a failing
+// settlement lookup cannot affect them and they never scan the chain. Previously this
+// test expected 503 because both actions reconciled on every public call.
+test("register and view do not scan the chain, so a failing lookup is not reached", async () => {
   const token = encodePayRequest({ to: MERCHANT, amount: "0.2", memo: "note" });
   const failing = async () => {
     throw new Error(LEAK);
   };
   const registered = deps({ records: [row(token)], find: failing });
   const registerResult = await payPost(post({ token, action: "register" }), registered.store);
-  assert.equal(registerResult.status, 503);
-  assertSafe(registerResult.body);
+  assert.equal(registerResult.status, 200);
+  assert.equal(registered.calls.find, 0);
   assert.equal(registered.calls.cancelled, 0);
+  assert.equal(registered.calls.paid, 0);
   const viewed = deps({ records: [row(token)], find: failing });
   const viewResult = await payPost(post({ token, action: "view" }), viewed.store);
-  assert.equal(viewResult.status, 503);
-  assertSafe(viewResult.body);
+  assert.equal(viewResult.status, 200);
+  assert.equal(viewed.calls.find, 0);
   assert.equal(viewed.current(token)?.paidTx, null);
   assert.equal(viewed.calls.cancelled, 0);
 });

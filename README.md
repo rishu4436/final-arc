@@ -49,3 +49,27 @@ Once a Redis pair is active, a failed Redis read or write does not fall back to 
 
 This repository does not record whether any deployed environment has those variables set.
 
+
+## API keys (production)
+
+API-key authentication for `/api/v1` (Developer API, SDK, agent payments, and API-key access to policies, escrows, and analytics) requires a server pepper:
+
+```bash
+FINAL_API_KEY_PEPPER=<random secret, at least 32 bytes, set as a Vercel Secret>
+```
+
+- Set it as an encrypted environment variable (Vercel → Project → Settings → Environment Variables, type Secret) for **Production** and **Preview**. Never commit it, never put it in `.env` files in the repository, and never send it to the browser.
+- Stored keys are `HMAC-SHA256(FINAL_API_KEY_PEPPER, secret)`. There is no unsalted SHA-256 fallback and the application never generates a pepper.
+- If the pepper is missing or blank, API-key authentication, key creation, and key rotation **fail closed** with `503 unavailable` ("API key authentication is not configured."). Wallet-signed dashboard requests are unaffected.
+- **Changing the pepper invalidates every existing API key.** Every merchant must create new keys afterwards. Rotate it only deliberately.
+
+This repository does not record whether any deployed environment has the pepper set.
+
+## Legacy `/api/pay` boundary (Phase 13)
+
+- `GET /api/pay?to=<address>` and `GET /api/statement?address=<address>` are merchant-private. They require the merchant's wallet authorization (action `payments.read`) or an API key with `payment_requests:read`. The authenticated merchant must equal the requested address; anything else is `404`.
+- `POST /api/pay` `register` stores a V2 link only after the existing EIP-712 merchant signature check. V1 links are unsigned, so V1 registration requires the payee's wallet authorization (`payments.register`) or an API key with `payment_requests:write`.
+- `GET /api/pay?token=` and the `view` action never create a record. `register` and `view` do not run a settlement scan. `GET /api/pay/observe` is unchanged and read-only.
+- The per-link `webhookUrl` is retired: it is not accepted, not overwritten, never fetched, and never returned. Use signed endpoints under `/api/v1/webhooks`.
+- `/api/pay`, `/api/statement`, and `/api/receipt/[hash]` are rate limited **per server process** (in memory; not shared across Vercel instances). Off Vercel, forwarded IP headers are not trusted and all callers share one bucket.
+- Per-merchant ceilings: 10,000 payment-request rows, 25 active (200 stored) API keys, 20 webhook endpoints, 50 policies. Exceeding one returns `409 limit_exceeded`.

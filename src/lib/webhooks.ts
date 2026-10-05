@@ -2,6 +2,7 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { getAddress, isAddress, parseUnits, type Address } from "viem";
 import { deriveMemoId } from "./finalRequest";
 import { decodePayLink } from "./payRequest";
+import { LIMIT_EXCEEDED_CODE, MAX_WEBHOOK_ENDPOINTS_PER_MERCHANT } from "./resourceLimits";
 import {
   mutatePayStoreBlob,
   readPayStoreBlob,
@@ -494,6 +495,13 @@ export async function createWebhookEndpoint(
       updatedAt: now,
     };
     await mutatePayStoreBlob((store) => {
+      // Phase 13 (P1-03): per-merchant endpoint ceiling. Throwing here aborts before the write.
+      const owned = Object.values(section(store).endpoints)
+        .map(asEndpoint)
+        .filter((existing): existing is WebhookEndpointRecord => !!existing && sameMerchant(existing, merchant)).length;
+      if (owned >= MAX_WEBHOOK_ENDPOINTS_PER_MERCHANT) {
+        throw new WebhookHttpError(409, LIMIT_EXCEEDED_CODE, "Webhook endpoint limit reached for this merchant.");
+      }
       section(store).endpoints[row.id] = row;
     });
     return { status: 200, body: { ...toPublicEndpoint(row), secret: row.secret } };

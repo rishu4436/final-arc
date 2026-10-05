@@ -20,6 +20,7 @@ import {
   type VerifiedSpend,
 } from "./paymentPolicy";
 import type { IntentFact, LedgerReservation, VerifiedSpendFact } from "./policyLedger";
+import { LIMIT_EXCEEDED_CODE, MAX_POLICIES_PER_MERCHANT } from "./resourceLimits";
 import { safeEmitWebhookEvent } from "./webhooks";
 import type { EmittableWebhookEvent } from "./webhooksCatalog";
 
@@ -550,11 +551,15 @@ export async function createPolicy(request: Request, deps: PolicyDeps): Promise<
     rules,
   };
   try {
-    await withMerchantPolicyLock(auth.merchant, async () => {
+    const limited = await withMerchantPolicyLock(auth.merchant, async () => {
       const store = await deps.readBlob();
+      // Phase 13 (P1-03): per-merchant policy ceiling. Delete removes rows, so this never locks a merchant out.
+      if (policiesForMerchant(store, auth.merchant).length >= MAX_POLICIES_PER_MERCHANT) return true;
       ensurePolicySection(store).records[policy.id] = policy;
       await deps.writeBlob(store);
+      return false;
     });
+    if (limited) return error(409, LIMIT_EXCEEDED_CODE, "Policy limit reached for this merchant.");
   } catch {
     return error(503, "store_unavailable", "Payment store is unavailable.");
   }

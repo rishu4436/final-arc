@@ -33,7 +33,6 @@ export function RequestForm() {
   const [link, setLink] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
-  const [webhookUrl, setWebhookUrl] = useState("");
   const [busy, setBusy] = useState(false);
 
   async function onSubmit(event: React.FormEvent) {
@@ -71,13 +70,14 @@ export function RequestForm() {
       const url = `${window.location.origin}/p/${sealed.token}`;
       setLink(url);
       rememberLink(address, sealed.token);
+      // V2 registration is accepted on the merchant's EIP-712 signature (verified server-side).
+      // Per-link webhook URLs are retired; use signed endpoints under Developer API → Webhooks.
       void fetch("/api/pay", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           token: sealed.token,
           action: "register",
-          webhookUrl: webhookUrl.trim() || undefined,
         }),
       });
     } catch (err) {
@@ -153,18 +153,10 @@ export function RequestForm() {
         />
       </label>
 
-      <label className="block">
-        <span className="mb-1 block text-xs uppercase tracking-[0.16em] text-[var(--muted)]">
-          Webhook (optional)
-        </span>
-        <input
-          type="url"
-          value={webhookUrl}
-          onChange={(e) => setWebhookUrl(e.target.value)}
-          placeholder="https://…"
-          className="mono w-full border-0 border-b border-[var(--line)] bg-transparent py-2 outline-none focus:border-[var(--ink)]"
-        />
-      </label>
+      <p className="text-xs text-[var(--muted)]">
+        Webhooks: add a signed endpoint under Developer API → Webhooks. Per-link webhook URLs are no longer
+        supported.
+      </p>
 
       <button
         type="submit"

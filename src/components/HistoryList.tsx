@@ -1,14 +1,17 @@
 "use client";
 
 import { CancelLinkButton } from "@/components/CancelLinkButton";
+import { WALLET_ACTIONS } from "@/lib/apiScopes";
 import { explorerTx, formatUsdc, shortHash } from "@/lib/format";
+import { registerMissingLinks } from "@/lib/legacyLinkSync";
 import { readLinks } from "@/lib/payLinksLocal";
 import { cancelOffer, decodePayLink, paymentLinkPhase } from "@/lib/payRequest";
 import type { PayRecord } from "@/lib/payStore";
+import { cachedWalletHeaders, forgetWalletHeaders } from "@/lib/walletAuthCache";
 import { useMounted } from "@/hooks/useMounted";
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
-import { useAccount } from "wagmi";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useAccount, useSignMessage } from "wagmi";
 
 function mergeRows(groups: PayRecord[][]): PayRecord[] {
   const map = new Map<string, PayRecord>();
@@ -42,28 +45,47 @@ export function HistoryList() {
   const [rows, setRows] = useState<PayRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
+  const { signMessageAsync } = useSignMessage();
+  const signRef = useRef(signMessageAsync);
+  signRef.current = signMessageAsync;
 
   const refresh = useCallback(async () => {
     if (!address) return;
-    const local = readLinks(address);
-    await Promise.all(
-      local.map((token) =>
-        fetch("/api/pay", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ token, action: "register" }),
-        }).catch(() => undefined),
-      ),
-    );
-    const res = await fetch(`/api/pay?to=${address}`);
-    const body = (await res.json()) as { records?: PayRecord[]; error?: string };
-    if (!res.ok) {
-      setError(body.error ?? "Could not load history.");
+    const sign = (args: { message: string }) => signRef.current(args);
+    // Phase 13 (P1-05): the payee list requires the existing wallet authorization ("payments.read").
+    const load = async () => {
+      const headers = await cachedWalletHeaders(WALLET_ACTIONS.paymentsRead, address, sign);
+      const res = await fetch(`/api/pay?to=${address}`, { headers, cache: "no-store" });
+      if (res.status === 401) forgetWalletHeaders(WALLET_ACTIONS.paymentsRead, address);
+      const body = (await res.json()) as { records?: PayRecord[]; error?: string };
+      return { res, body };
+    };
+    let loaded: Awaited<ReturnType<typeof load>>;
+    try {
+      loaded = await load();
+    } catch {
+      setError("Sign the wallet authorization to load history.");
       return;
     }
+    if (!loaded.res.ok) {
+      setError(loaded.body.error ?? "Could not load history.");
+      return;
+    }
+    const local = readLinks(address);
+    const known = new Set((loaded.body.records ?? []).map((row) => row.token));
+    if ((await registerMissingLinks(local.filter((token) => !known.has(token)), address, sign)) > 0) {
+      try {
+        const again = await load();
+        if (again.res.ok) loaded = again;
+      } catch {
+        // Keep the first list.
+      }
+    }
+    const body = loaded.body;
+    const listed = new Set((body.records ?? []).map((row) => row.token));
     const remembered = (
       await Promise.all(
-        local.map(async (token) => {
+        local.filter((token) => !listed.has(token)).map(async (token) => {
           const item = await fetch(`/api/pay?token=${encodeURIComponent(token)}`);
           if (!item.ok) return null;
           const payload = (await item.json()) as { record?: PayRecord };

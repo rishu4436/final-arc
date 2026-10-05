@@ -70,6 +70,13 @@ export const WALLET_ACTIONS = {
   policiesUpdate: "policies.update",
   policiesDelete: "policies.delete",
   analyticsRead: "analytics.read",
+  /**
+   * Phase 13. Legacy merchant-scoped reads: GET /api/pay?to= and GET /api/statement.
+   * The signed merchant must equal the requested payee address.
+   */
+  paymentsRead: "payments.read",
+  /** Phase 13. Legacy V1 link registration (POST /api/pay register). V1 links are unsigned. */
+  paymentsRegister: "payments.register",
 } as const;
 
 export type WalletAction = (typeof WALLET_ACTIONS)[keyof typeof WALLET_ACTIONS];

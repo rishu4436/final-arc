@@ -12,6 +12,11 @@ import {
   type WalletAction,
 } from "./apiScopes";
 import { mutatePayStoreBlob, readPayStoreBlob, type ApiKeyStoreSection } from "./payStore";
+import {
+  LIMIT_EXCEEDED_CODE,
+  MAX_ACTIVE_API_KEYS_PER_MERCHANT,
+  MAX_STORED_API_KEYS_PER_MERCHANT,
+} from "./resourceLimits";
 
 /**
  * API keys authorize /api/v1. The secret is returned once. The store keeps
@@ -410,6 +415,22 @@ export async function handleCreateApiKey(request: Request, runtime: ApiKeyRuntim
   if (isApiError(scopes)) return scopes;
   const pepper = pepperOrFail(runtime);
   if (typeof pepper !== "string") return apiError(pepper.status, pepper.code, pepper.message);
+
+  // Phase 13 (P1-03): per-merchant key ceilings. Revoked keys stay stored, so both
+  // active and stored rows are capped. Not atomic across instances (P1-02).
+  let existingKeys: ApiKeyRecord[];
+  try {
+    existingKeys = await runtime.listKeys();
+  } catch {
+    return apiError(503, "store_unavailable", "Payment store is unavailable.");
+  }
+  const mine = existingKeys.filter((row) => isAddress(row.merchant) && getAddress(row.merchant) === auth.merchant);
+  if (mine.filter((row) => !row.revoked).length >= MAX_ACTIVE_API_KEYS_PER_MERCHANT) {
+    return apiError(409, LIMIT_EXCEEDED_CODE, "Active API key limit reached. Revoke an unused key first.");
+  }
+  if (mine.length >= MAX_STORED_API_KEYS_PER_MERCHANT) {
+    return apiError(409, LIMIT_EXCEEDED_CODE, "API key limit reached for this merchant.");
+  }
 
   let expiresAt: string | null = null;
   if (body.expiresAt !== undefined && body.expiresAt !== null) {
