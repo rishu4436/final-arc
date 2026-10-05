@@ -80,6 +80,22 @@ test("open, connected, wrong network, insufficient balance, and submitted stay u
   assert.equal(resolveCheckoutState(ready).canPay, true);
   assert.equal(resolveCheckoutState({ ...ready, chainId: 1 }).state, "wrong_network");
   assert.equal(resolveCheckoutState({ ...ready, chainId: null }).state, "wrong_network");
+  assert.equal(
+    checkoutStatusText("wrong_network"),
+    "Wrong network. Switch to Arc mainnet to pay.",
+  );
+  assert.equal(
+    resolveCheckoutState({ ...ready, chainId: 1, availability: "failed" }).state,
+    "wrong_network",
+  );
+  assert.equal(
+    resolveCheckoutState({ ...ready, chainId: 1, availability: "unknown" }).state,
+    "wrong_network",
+  );
+  assert.equal(
+    resolveCheckoutState({ ...ready, chainId: 1, signatureOk: null }).state,
+    "wrong_network",
+  );
   assert.equal(resolveCheckoutState({ ...ready, balance: "insufficient" }).state, "insufficient_balance");
   const submitted = resolveCheckoutState({ ...ready, flow: "submitted" });
   assert.equal(submitted.state, "submitted");

@@ -80,9 +80,14 @@ function kvBody(store: { records: Record<string, PayRecord> } | null, status = 2
 
 function decodeSet(body: string | undefined): { records: Record<string, PayRecord> } {
   assert.equal(typeof body, "string");
-  const inner = JSON.parse(body as string) as unknown;
-  assert.equal(typeof inner, "string");
-  return JSON.parse(inner as string) as { records: Record<string, PayRecord> };
+  const parsed = JSON.parse(body as string) as unknown;
+  // Command API: ["SET", "final-pay-store", "<json>"]
+  if (Array.isArray(parsed) && parsed[0] === "SET" && typeof parsed[2] === "string") {
+    return JSON.parse(parsed[2]) as { records: Record<string, PayRecord> };
+  }
+  // Legacy path-style body was JSON.stringify(JSON.stringify(store)).
+  assert.equal(typeof parsed, "string");
+  return JSON.parse(parsed as string) as { records: Record<string, PayRecord> };
 }
 
 async function withEnv(fn: () => Promise<void>): Promise<void> {

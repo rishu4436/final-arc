@@ -1,6 +1,7 @@
 "use client";
 
-import { ARC_CHAIN_ID, arcWalletChain } from "@/lib/arc";
+import { ARC_CHAIN_ID } from "@/lib/arc";
+import { switchToArcNetwork } from "@/lib/switchToArc";
 import { sanitizeError } from "@/lib/errors";
 import { shortAddr } from "@/lib/format";
 import { useMounted } from "@/hooks/useMounted";
@@ -27,16 +28,13 @@ export function ConnectButton({ preferArc = true }: { preferArc?: boolean }) {
   const [error, setError] = useState<string | null>(null);
   const [picking, setPicking] = useState(false);
   const mounted = useMounted();
-  const wrongChain = preferArc && isConnected && chainId !== ARC_CHAIN_ID;
+  const wrongChain = isConnected && chainId !== ARC_CHAIN_ID;
   const ready = mounted && isConnected && Boolean(address);
 
   const wallets = useMemo(() => uniqueConnectors(connectors), [connectors]);
 
   async function switchToArc() {
-    await switchChainAsync({
-      chainId: ARC_CHAIN_ID,
-      addEthereumChainParameter: arcWalletChain(),
-    });
+    await switchToArcNetwork(switchChainAsync);
   }
 
   async function connectWith(connector: Connector) {

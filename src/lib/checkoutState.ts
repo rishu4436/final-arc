@@ -171,12 +171,6 @@ export function resolveCheckoutState(input: {
   if (!input.linkValid || input.signatureOk === false) {
     return { state: "error", paid: false, canPay: false };
   }
-  if (input.signatureOk === null || input.availability === "unknown") {
-    return { state: "loading", paid: false, canPay: false };
-  }
-  if (input.availability === "failed") {
-    return { state: "unavailable", paid: false, canPay: false };
-  }
   const phase: PayLinkPhase = paymentLinkPhase({
     paid: input.paid,
     cancelled: input.cancelled,
@@ -194,8 +188,23 @@ export function resolveCheckoutState(input: {
   }
   if (input.flow === "submitted") return { state: "submitted", paid: false, canPay: false };
   if (input.wallet === "connecting") return { state: "connecting", paid: false, canPay: false };
-  if (input.wallet === "disconnected") return { state: "open", paid: false, canPay: false };
+  if (input.wallet === "disconnected") {
+    if (input.signatureOk === null || input.availability === "unknown") {
+      return { state: "loading", paid: false, canPay: false };
+    }
+    if (input.availability === "failed") {
+      return { state: "unavailable", paid: false, canPay: false };
+    }
+    return { state: "open", paid: false, canPay: false };
+  }
+  // Connected: offer network switch before status/balance gates so payers are never stuck.
   if (input.chainId !== ARC_CHAIN_ID) return { state: "wrong_network", paid: false, canPay: false };
+  if (input.signatureOk === null || input.availability === "unknown") {
+    return { state: "loading", paid: false, canPay: false };
+  }
+  if (input.availability === "failed") {
+    return { state: "unavailable", paid: false, canPay: false };
+  }
   if (input.balance === "insufficient") {
     return { state: "insufficient_balance", paid: false, canPay: false };
   }
@@ -214,7 +223,7 @@ export function checkoutStatusText(state: CheckoutState, detail?: string | null)
     case "connected":
       return "Ready to pay on Arc.";
     case "wrong_network":
-      return "Switch to Arc";
+      return "Wrong network. Switch to Arc mainnet to pay.";
     case "insufficient_balance":
       return "Not enough USDC for this payment.";
     case "preparing":

@@ -1,7 +1,8 @@
 "use client";
 
 import { SendForm } from "@/components/SendForm";
-import { ARC_CHAIN_ID, arcWalletChain } from "@/lib/arc";
+import { ARC_CHAIN_ID } from "@/lib/arc";
+import { switchToArcNetwork } from "@/lib/switchToArc";
 import { addDecimal, CCTP_SOURCES, GAS_BUFFER_USDC, sourceByChainId } from "@/lib/cctp";
 import { sanitizeError } from "@/lib/errors";
 import { sendMemoPayment } from "@/lib/sendMemo";
@@ -44,6 +45,10 @@ export function CrossChainPay(
   async function switchSource(id: number) {
     setStatus(null);
     try {
+      if (id === ARC_CHAIN_ID) {
+        await switchToArcNetwork(switchChainAsync);
+        return;
+      }
       await switchChainAsync({ chainId: id });
     } catch (error) {
       setStatus(sanitizeError(error));
@@ -72,10 +77,7 @@ export function CrossChainPay(
         return;
       }
       setStatus("USDC minted on Arc. Switching network…");
-      await switchChainAsync({
-        chainId: ARC_CHAIN_ID,
-        addEthereumChainParameter: arcWalletChain(),
-      });
+      await switchToArcNetwork(switchChainAsync);
       if (!publicClient || !walletClient) {
         setStatus("USDC is on Arc. Connect on Arc and use Pay below.");
         return;
@@ -141,10 +143,20 @@ export function CrossChainPay(
               {busy ? "Working…" : `Bridge from ${source.label} and pay`}
             </button>
           ) : (
-            <p className="text-sm text-[var(--stamp)]">
-              Switch to Arc, or to a CCTP source (Base, Ethereum, Arbitrum, OP, Polygon,
-              Avalanche).
-            </p>
+            <div className="flex flex-col gap-2">
+              <p className="text-sm text-[var(--stamp)]">
+                Wrong network. Switch to Arc, or to a CCTP source (Base, Ethereum, Arbitrum, OP,
+                Polygon, Avalanche).
+              </p>
+              <button
+                type="button"
+                disabled={busy || !address}
+                onClick={() => void switchSource(ARC_CHAIN_ID)}
+                className="rounded-sm border border-[var(--ink)] bg-[var(--ink)] px-4 py-3 text-sm text-[var(--paper)] disabled:opacity-40"
+              >
+                Switch network to Arc
+              </button>
+            </div>
           )}
           {status ? <p className="text-sm text-[var(--muted)]">{status}</p> : null}
         </div>

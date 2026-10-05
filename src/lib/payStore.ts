@@ -176,6 +176,9 @@ function parseKvResult(result: unknown): StoreFile {
   let parsed: unknown;
   try {
     parsed = JSON.parse(result);
+    // Older writes used path-style SET with a JSON-string body and stored an
+    // extra quoted layer. Unwrap one accidental string so those blobs still load.
+    if (typeof parsed === "string") parsed = JSON.parse(parsed);
   } catch {
     throw new Error("Payment store read failed.");
   }
@@ -218,16 +221,19 @@ async function readKv(creds: { url: string; token: string }): Promise<StoreFile>
 }
 
 async function writeKv(creds: { url: string; token: string }, store: StoreFile): Promise<void> {
+  // Use the Redis command API so the value is stored as one JSON string.
+  // Path-style /set with JSON.stringify(JSON.stringify(store)) double-encoded
+  // the blob and made every later read fail isStoreFile.
   const value = JSON.stringify(store);
   let res: Response;
   try {
-    res = await fetch(`${creds.url}/set/${KV_KEY}`, {
+    res = await fetch(creds.url, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${creds.token}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(value),
+      body: JSON.stringify(["SET", KV_KEY, value]),
     });
   } catch {
     throw new Error("Payment store write failed.");

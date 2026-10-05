@@ -1,6 +1,7 @@
 "use client";
 
 import { ARC_CHAIN_ID, USDC_ADDRESS, USDC_DECIMALS } from "@/lib/arc";
+import { switchToArcNetwork } from "@/lib/switchToArc";
 import { explorerTx, formatUsdc } from "@/lib/format";
 import { assertV2Payable } from "@/lib/payRequest";
 import { sendMemoPayment } from "@/lib/sendMemo";
@@ -14,6 +15,7 @@ import {
   useBalance,
   usePublicClient,
   useReadContract,
+  useSwitchChain,
   useWalletClient,
 } from "wagmi";
 
@@ -31,6 +33,8 @@ export function SendForm({
   const { address, chainId, isConnected } = useAccount();
   const publicClient = usePublicClient();
   const { data: walletClient } = useWalletClient();
+  const { switchChainAsync, isPending: isSwitching } = useSwitchChain();
+  const [switchError, setSwitchError] = useState<string | null>(null);
   const [to, setTo] = useState(locked?.to ?? "");
   const [amount, setAmount] = useState(locked?.amount ?? "");
   const [memo, setMemo] = useState(locked?.memo ?? "");
@@ -188,7 +192,28 @@ export function SendForm({
         <p className="text-sm text-[var(--stamp)]">This Arc USDC payment request has expired.</p>
       ) : null}
       {onWrongChain ? (
-        <p className="text-sm text-[var(--stamp)]">Wrong network. Switch to Arc (5042).</p>
+        <div className="flex flex-col gap-2">
+          <p className="text-sm text-[var(--stamp)]">Wrong network. Switch to Arc (chain {ARC_CHAIN_ID}).</p>
+          <button
+            type="button"
+            disabled={isSwitching}
+            className="rounded-sm border border-[var(--ink)] bg-[var(--ink)] px-4 py-3 text-sm text-[var(--paper)] disabled:opacity-40"
+            onClick={() => {
+              setSwitchError(null);
+              setStatus(null);
+              void switchToArcNetwork(switchChainAsync).catch((error: unknown) => {
+                setSwitchError(
+                  error instanceof Error
+                    ? error.message
+                    : "Could not switch to Arc. Switch to chain 5042 in your wallet.",
+                );
+              });
+            }}
+          >
+            {isSwitching ? "Switching…" : "Switch network to Arc"}
+          </button>
+          {switchError ? <p className="text-sm text-[var(--stamp)]">{switchError}</p> : null}
+        </div>
       ) : null}
       {status ? <p className="text-sm text-[var(--muted)]">{status}</p> : null}
       {failHash ? (

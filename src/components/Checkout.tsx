@@ -7,9 +7,9 @@ import {
   MIN_MAX_FEE_PER_GAS,
   USDC_ADDRESS,
   USDC_DECIMALS,
-  arcWalletChain,
   memoAbi,
 } from "@/lib/arc";
+import { switchToArcNetwork } from "@/lib/switchToArc";
 import {
   checkoutAmountLabel,
   checkoutExplorer,
@@ -81,7 +81,7 @@ export function Checkout({ token }: { token: string }) {
   const { address, chainId, isConnected, isConnecting } = useAccount();
   const { connectors, connectAsync, isPending } = useConnect();
   const { disconnect } = useDisconnect();
-  const { switchChainAsync } = useSwitchChain();
+  const { switchChainAsync, isPending: isSwitching } = useSwitchChain();
   const publicClient = usePublicClient({ chainId: ARC_CHAIN_ID });
   const { data: walletClient } = useWalletClient({ chainId: ARC_CHAIN_ID });
   const wallets = useMemo(() => uniqueConnectors(connectors), [connectors]);
@@ -255,10 +255,7 @@ export function Checkout({ token }: { token: string }) {
   async function onSwitch() {
     setSwitchError(null);
     try {
-      await switchChainAsync({
-        chainId: ARC_CHAIN_ID,
-        addEthereumChainParameter: arcWalletChain(),
-      });
+      await switchToArcNetwork(switchChainAsync);
     } catch (error) {
       const message = error instanceof Error ? error.message : "switch failed";
       setSwitchError(presentSwitchFailure(message));
@@ -329,6 +326,13 @@ export function Checkout({ token }: { token: string }) {
           ? "Balance unavailable"
           : `${formatUsdc(formatUnits(tokenBalance ?? 0n, USDC_DECIMALS))} USDC`;
 
+  const terminalPayment =
+    resolved.state === "completed" ||
+    resolved.state === "cancelled" ||
+    resolved.state === "expired";
+  const needsNetworkSwitch =
+    mounted && isConnected && chainId !== ARC_CHAIN_ID && !terminalPayment;
+
   return (
     <article className="receipt-sheet overflow-hidden">
       <div className="border-b border-[var(--line)] px-5 py-6 sm:px-8">
@@ -379,7 +383,9 @@ export function Checkout({ token }: { token: string }) {
       </div>
 
       <div className="px-5 py-6 sm:px-8" aria-live="polite">
-        <p className="text-sm">{status}</p>
+        <p className="text-sm">
+          {needsNetworkSwitch ? "Wrong network. Switch to Arc mainnet to pay." : status}
+        </p>
         {resolved.state === "preparing" || resolved.state === "awaiting_signature" || resolved.state === "submitted" ? (
           <ol className="mt-3 space-y-1 text-sm text-[var(--muted)]">
             <li>{stages.preparing}</li>
@@ -391,7 +397,11 @@ export function Checkout({ token }: { token: string }) {
         {mounted && isConnected && address ? (
           <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
             <span className="mono">{shortAddr(address)}</span>
-            <span className="text-[var(--muted)]">{chainId === ARC_CHAIN_ID ? "Arc" : "Wrong network"}</span>
+            {chainId === ARC_CHAIN_ID ? (
+              <span className="text-[var(--muted)]">Arc</span>
+            ) : (
+              <span className="text-[var(--stamp)]">Wrong network</span>
+            )}
             {balanceLabel ? <span className="text-[var(--muted)]">{balanceLabel}</span> : null}
             <button
               type="button"
@@ -404,7 +414,23 @@ export function Checkout({ token }: { token: string }) {
         ) : null}
 
         <div className="mt-6">
-          {resolved.state === "loading" ? null : resolved.state === "unavailable" ? (
+          {needsNetworkSwitch ? (
+            <div>
+              <button
+                type="button"
+                disabled={isSwitching}
+                className="w-full border border-[var(--ink)] bg-[var(--ink)] px-4 py-4 text-base text-[var(--paper)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 disabled:opacity-40"
+                onClick={() => void onSwitch()}
+              >
+                {isSwitching ? "Switching…" : "Switch network to Arc"}
+              </button>
+              <p className="mt-3 text-sm text-[var(--muted)]">
+                This payment settles on Arc mainnet (chain {ARC_CHAIN_ID}). Your wallet is on another
+                network.
+              </p>
+              {switchError ? <p className="mt-3 text-sm text-[var(--stamp)]">{switchError}</p> : null}
+            </div>
+          ) : resolved.state === "loading" ? null : resolved.state === "unavailable" ? (
             <button
               type="button"
               className="text-sm underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
@@ -425,18 +451,7 @@ export function Checkout({ token }: { token: string }) {
                 {stages.view}
               </a>
             </p>
-          ) : resolved.state === "expired" || resolved.state === "cancelled" ? null : resolved.state === "wrong_network" ? (
-            <div>
-              <button
-                type="button"
-                className="w-full border border-[var(--ink)] bg-[var(--ink)] px-4 py-4 text-base text-[var(--paper)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
-                onClick={() => void onSwitch()}
-              >
-                Switch to Arc
-              </button>
-              {switchError ? <p className="mt-3 text-sm text-[var(--stamp)]">{switchError}</p> : null}
-            </div>
-          ) : resolved.state === "submitted" && submittedHash ? (
+          ) : resolved.state === "expired" || resolved.state === "cancelled" ? null : resolved.state === "submitted" && submittedHash ? (
             <div className="text-sm">
               <p className="mono break-all">{shortHash(submittedHash)}</p>
               <p className="mt-2 text-[var(--muted)]">Submitted is not paid. Paid appears only when this request is recorded as paid.</p>
