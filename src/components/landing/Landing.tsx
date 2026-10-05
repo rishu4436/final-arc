@@ -59,6 +59,9 @@ export function Landing() {
             <BrandMark />
           </Link>
           <div className="flex items-center gap-5">
+            <Link href="/dashboard" className="text-sm text-[var(--muted)] no-underline">
+              Workspace
+            </Link>
             <a href="#send" className="hidden text-sm text-[var(--muted)] no-underline sm:inline">
               Desk
             </a>

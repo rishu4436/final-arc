@@ -1,6 +1,6 @@
 import { BrandMark } from "@/components/BrandMark";
 import { ConnectButton } from "@/components/ConnectButton";
-import { PaySheet } from "@/components/PaySheet";
+import { Checkout } from "@/components/Checkout";
 import { USDC_DECIMALS } from "@/lib/arc";
 import { verifyFinalRequest } from "@/lib/finalRequest";
 import { formatUsdc } from "@/lib/format";
@@ -54,7 +54,7 @@ export default async function PayPage({ params }: Props) {
         {!link || !signatureOk ? (
           <p className="text-[var(--stamp)]">This payment link is not valid.</p>
         ) : (
-          <PaySheet token={decoded} />
+          <Checkout token={decoded} />
         )}
       </main>
     </div>

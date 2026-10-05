@@ -15,6 +15,7 @@ import {
 } from "./payStore";
 import { PAYMENT_STATUS_UNAVAILABLE, reconcilePaymentRecord } from "./reconcilePayment";
 import { resolveCancellation } from "./resolveCancellation";
+import { emitPaymentRequestCancelled, emitPaymentRequestCreated } from "./webhooks";
 
 export type PayHttpResult = {
   status: number;
@@ -122,7 +123,10 @@ async function payPostInner(body: PostBody, deps: PayStatusDeps): Promise<PayHtt
   if (action === "register") {
     const webhookUrl =
       typeof body.webhookUrl === "string" && /^https:\/\//i.test(body.webhookUrl) ? body.webhookUrl : null;
+    const existed = (await deps.getRecord(token)) != null;
     const row = await deps.upsertRecord(blankRecord(token, identity, webhookUrl));
+    // First store only. Developer API create that already stored this token does not double-emit here.
+    if (!existed) emitPaymentRequestCreated(row);
     return { status: 200, body: { record: await withPaid(row, deps) } };
   }
 
@@ -166,6 +170,7 @@ async function payPostInner(body: PostBody, deps: PayStatusDeps): Promise<PayHtt
       return { status: resolved.status, body: { error: resolved.error } };
     }
     if (resolved.notify) void deps.notifyWebhook(resolved.record, resolved.notify);
+    if (resolved.notify === "cancelled") emitPaymentRequestCancelled(resolved.record);
     return { status: 200, body: { record: resolved.record } };
   }
 

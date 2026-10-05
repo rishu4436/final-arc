@@ -1,6 +1,6 @@
 import { BrandMark } from "@/components/BrandMark";
 import { ConnectButton } from "@/components/ConnectButton";
-import { loadReceipt } from "@/lib/loadReceipt";
+import { isArcProofBody, proofAmountDisplay, proofStatusLabel, verifyArcTransaction } from "@/lib/arcProof";
 import { formatUsdc } from "@/lib/format";
 import type { Metadata } from "next";
 import Link from "next/link";
@@ -10,30 +10,22 @@ type Props = { params: Promise<{ hash: string }> };
 
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { hash } = await params;
-  const result = await loadReceipt(hash);
-  if ("error" in result) {
-    return { title: "Receipt not found · Final" };
-  }
-  const { parsed } = result;
-  if (!parsed.memoEventValid) {
+  const result = await verifyArcTransaction(hash);
+  const label = proofStatusLabel(result.status);
+  if (!isArcProofBody(result) || result.status !== "VERIFIED") {
     return {
-      title: "Not a Memo payment · Final",
-      description: "No valid Arc Memo event was found. A call to the Memo contract is not enough.",
+      title: `${label} · Final`,
+      description: "Arc transaction proof. A verified transaction is not a paid payment request.",
     };
   }
-  if (!parsed.settlementValid || !parsed.transactionSucceeded) {
-    return {
-      title: "Settlement not verified · Final",
-      description: "A Memo event was found, but the exact USDC settlement was not established.",
-    };
-  }
-  const title = `${formatUsdc(parsed.amount)} USDC · ${parsed.memo ?? "Memo"}`;
+  const amount = proofAmountDisplay(result);
+  const title = amount ? `${formatUsdc(amount)} USDC · ${result.memo.memo ?? "Memo"}` : "Verified · Final";
   return {
     title,
-    description: `Arc Memo receipt. Final at block ${parsed.blockNumber}.`,
+    description: `Arc transaction proof. Block ${result.transaction.blockNumber}. This does not name a payment request.`,
     openGraph: {
       title,
-      description: `USDC on Arc, memo ${parsed.memo ?? "—"}. One-block finality.`,
+      description: "Verified Arc Memo and USDC settlement. Not a payment-request receipt by itself.",
       url: `/r/${hash}`,
     },
   };
@@ -41,7 +33,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
 
 export default async function ReceiptPage({ params }: Props) {
   const { hash } = await params;
-  const initial = await loadReceipt(hash);
+  const initial = await verifyArcTransaction(hash);
   return (
     <div className="min-h-screen">
       <header className="mx-auto flex max-w-5xl items-center justify-between gap-4 px-5 py-5">
@@ -51,7 +43,7 @@ export default async function ReceiptPage({ params }: Props) {
         <ConnectButton />
       </header>
       <main className="mx-auto max-w-xl px-5 pb-16 pt-4">
-        <ReceiptView hash={hash} initial={"error" in initial ? { error: initial.error } : initial} />
+        <ReceiptView hash={hash} initial={initial} />
       </main>
     </div>
   );

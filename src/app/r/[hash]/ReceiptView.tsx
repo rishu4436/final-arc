@@ -1,43 +1,16 @@
 "use client";
 
 import { ReceiptCard } from "@/components/ReceiptCard";
-import type { LoadedReceipt } from "@/lib/loadReceipt";
+import { isArcProofBody, proofStatusLabel, type ArcProofResult } from "@/lib/arcProof";
 import Link from "next/link";
-import { useEffect, useState } from "react";
 
-export function ReceiptView({
-  hash,
-  initial,
-}: {
-  hash: string;
-  initial?: LoadedReceipt | { error: string };
-}) {
-  const [data, setData] = useState<LoadedReceipt | null>(
-    initial && !("error" in initial) ? initial : null,
-  );
-  const [error, setError] = useState<string | null>(
-    initial && "error" in initial ? initial.error : null,
-  );
+const COPY: Record<Exclude<ArcProofResult["status"], "VERIFIED" | "INVALID" | "PARTIAL">, string> = {
+  INVALID_FORMAT: "This transaction hash is not valid.",
+  NOT_FOUND: "This transaction was not found on Arc.",
+  UNAVAILABLE: "Arc transaction data is unavailable. That is not the same as an invalid transaction.",
+};
 
-  useEffect(() => {
-    if (data) return;
-    let cancelled = false;
-    fetch(`/api/receipt/${hash}`)
-      .then(async (res) => {
-        const body = (await res.json()) as LoadedReceipt & { error?: string };
-        if (!res.ok) throw new Error(body.error ?? "Not found");
-        if (!cancelled) setData(body);
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) {
-          setError(err instanceof Error ? err.message : "Could not load receipt.");
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [hash, data]);
-
+export function ReceiptView({ hash, initial }: { hash: string; initial: ArcProofResult }) {
   return (
     <div>
       <p className="mb-6 text-sm text-[var(--muted)]">
@@ -45,16 +18,17 @@ export function ReceiptView({
           ← Send another
         </Link>
       </p>
-      {error ? (
-        <p className="text-[var(--stamp)]">{error}</p>
-      ) : !data ? (
-        <p className="text-[var(--muted)]">Loading receipt…</p>
+      {isArcProofBody(initial) ? (
+        <ReceiptCard proof={initial} />
       ) : (
-        <ReceiptCard
-          parsed={data.parsed}
-          certificate={data.certificate}
-          certCheck={data.certCheck}
-        />
+        <article className="border border-[var(--line)] bg-[#fbf7ef] px-6 py-8 sm:px-8">
+          <p className="text-xs uppercase tracking-[0.22em] text-[var(--muted)]">FINAL · Arc · 5042</p>
+          <h1 className="display mt-2 text-4xl">{proofStatusLabel(initial.status)}</h1>
+          <p className="mt-4 text-sm" role="status">
+            {COPY[initial.status]}
+          </p>
+          <p className="mt-3 break-all font-mono text-xs text-[var(--muted)]">{hash}</p>
+        </article>
       )}
     </div>
   );

@@ -17,7 +17,55 @@ export type PayRecord = {
   webhookUrl: string | null;
 };
 
-type StoreFile = { records: Record<string, PayRecord> };
+/** Optional webhooks section. Old blobs omit it. Payment list APIs never return it. */
+export type WebhookStoreSection = {
+  endpoints: Record<string, unknown>;
+  deliveries: Record<string, unknown>;
+};
+
+/** Optional API key section. Old blobs omit it. Payment list APIs never return it. Secrets are hashes. */
+export type ApiKeyStoreSection = {
+  keys: Record<string, unknown>;
+};
+
+/** Optional escrow section. Not part of PayRecord. Old blobs omit it. */
+export type EscrowStoreSection = {
+  records: Record<string, unknown>;
+};
+
+/**
+ * Optional machine-payment section. Not part of PayRecord.
+ * Old blobs omit it. Idempotency lives here, in the same JSON or Redis blob.
+ */
+export type AgentStoreSection = {
+  intents: Record<string, unknown>;
+  idempotency: Record<string, unknown>;
+};
+
+/**
+ * Optional policy section. Not part of PayRecord.
+ * Reservations are authorization accounting only. They are not balances.
+ * Old blobs omit this section.
+ */
+export type PolicyStoreSection = {
+  records: Record<string, unknown>;
+  reservations: Record<string, unknown>;
+  denials: Record<string, unknown>;
+};
+
+export type StoreFile = {
+  records: Record<string, PayRecord>;
+  /** Merchant webhook endpoints and delivery log. Not part of PayRecord. */
+  webhooks?: WebhookStoreSection;
+  /** Developer API keys. Not part of PayRecord. Plaintext secrets are never stored. */
+  apiKeys?: ApiKeyStoreSection;
+  /** Escrow agreements. Not part of PayRecord. */
+  escrows?: EscrowStoreSection;
+  /** Machine payment intents and idempotency. Not part of PayRecord. */
+  agents?: AgentStoreSection;
+  /** Machine-payment policies, reservations, and denial audit. Not part of PayRecord. */
+  policies?: PolicyStoreSection;
+};
 
 const KV_KEY = "final-pay-store";
 
@@ -41,6 +89,17 @@ function kvCreds(): { url: string; token: string } | null {
   );
 }
 
+/**
+ * Which backend the pay store is using right now. Policy spend reservations use
+ * this to pick an atomic ledger (Redis EVAL compare-and-set) or to refuse
+ * spend-cap reservations on the JSON file. Credentials never leave the server.
+ */
+export function payStoreBackend(): { kind: "redis"; url: string; token: string } | { kind: "file"; path: string } {
+  const kv = kvCreds();
+  if (kv) return { kind: "redis", url: kv.url, token: kv.token };
+  return { kind: "file", path: storePath() };
+}
+
 function storePath(): string {
   return process.env.FINAL_PAY_STORE || join(process.cwd(), "data", "pay-store.json");
 }
@@ -48,7 +107,66 @@ function storePath(): string {
 function isStoreFile(value: unknown): value is StoreFile {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const records = (value as StoreFile).records;
-  return !!records && typeof records === "object" && !Array.isArray(records);
+  if (!records || typeof records !== "object" || Array.isArray(records)) return false;
+  const webhooks = (value as StoreFile).webhooks;
+  if (webhooks !== undefined && (!webhooks || typeof webhooks !== "object" || Array.isArray(webhooks))) return false;
+  const apiKeys = (value as StoreFile).apiKeys;
+  if (apiKeys !== undefined && (!apiKeys || typeof apiKeys !== "object" || Array.isArray(apiKeys))) return false;
+  const escrows = (value as StoreFile).escrows;
+  if (escrows !== undefined && (!escrows || typeof escrows !== "object" || Array.isArray(escrows))) return false;
+  const agents = (value as StoreFile).agents;
+  if (agents !== undefined) {
+    if (!agents || typeof agents !== "object" || Array.isArray(agents)) return false;
+    const intents = agents.intents;
+    const idempotency = agents.idempotency;
+    if (!intents || typeof intents !== "object" || Array.isArray(intents)) return false;
+    if (!idempotency || typeof idempotency !== "object" || Array.isArray(idempotency)) return false;
+  }
+  const policies = (value as StoreFile).policies;
+  if (policies !== undefined) {
+    if (!policies || typeof policies !== "object" || Array.isArray(policies)) return false;
+    if (!policies.records || typeof policies.records !== "object" || Array.isArray(policies.records)) return false;
+    if (!policies.reservations || typeof policies.reservations !== "object" || Array.isArray(policies.reservations)) {
+      return false;
+    }
+    if (!policies.denials || typeof policies.denials !== "object" || Array.isArray(policies.denials)) return false;
+  }
+  return true;
+}
+
+/** Payment writers that omit webhooks must not wipe a stored webhook section. */
+function preserveWebhookSection(current: StoreFile, outgoing: StoreFile): void {
+  if (outgoing.webhooks === undefined && current.webhooks !== undefined) {
+    outgoing.webhooks = current.webhooks;
+  }
+}
+
+/** Payment writers that omit apiKeys must not wipe stored API key hashes. */
+function preserveApiKeySection(current: StoreFile, outgoing: StoreFile): void {
+  if (outgoing.apiKeys === undefined && current.apiKeys !== undefined) {
+    outgoing.apiKeys = current.apiKeys;
+  }
+}
+
+/** Payment writers that omit escrows must not wipe escrow records. */
+function preserveEscrowSection(current: StoreFile, outgoing: StoreFile): void {
+  if (outgoing.escrows === undefined && current.escrows !== undefined) {
+    outgoing.escrows = current.escrows;
+  }
+}
+
+/** Payment writers that omit agents must not wipe intent or idempotency rows. */
+function preserveAgentSection(current: StoreFile, outgoing: StoreFile): void {
+  if (outgoing.agents === undefined && current.agents !== undefined) {
+    outgoing.agents = current.agents;
+  }
+}
+
+/** Payment writers that omit policies must not wipe policy, reservation, or denial rows. */
+function preservePolicySection(current: StoreFile, outgoing: StoreFile): void {
+  if (outgoing.policies === undefined && current.policies !== undefined) {
+    outgoing.policies = current.policies;
+  }
 }
 
 /** Missing key (result null) is an empty store. Anything else malformed is a failure. */
@@ -165,6 +283,11 @@ function preserveDurableFlags(current: StoreFile, outgoing: StoreFile): void {
 async function writeStore(store: StoreFile): Promise<void> {
   const current = await readStore();
   preserveDurableFlags(current, store);
+  preserveWebhookSection(current, store);
+  preserveApiKeySection(current, store);
+  preserveEscrowSection(current, store);
+  preserveAgentSection(current, store);
+  preservePolicySection(current, store);
   const kv = kvCreds();
   if (kv) {
     await writeKv(kv, store);
@@ -358,4 +481,33 @@ export async function markPaid(token: string, proof: PaidProof): Promise<PayReco
   store.records[token] = next;
   await writeStore(store);
   return next;
+}
+
+/**
+ * Every row in the existing blob. Lookup is O(n). This does not add a key,
+ * a second store, or a public list of merchants.
+ */
+export async function listRecords(): Promise<PayRecord[]> {
+  const store = await readStore();
+  return Object.values(store.records);
+}
+
+
+/**
+ * Full blob for webhook infrastructure. Payment helpers keep using readStore/writeStore.
+ * Callers must not put webhook secrets on PayRecord or return this blob from /api/pay.
+ */
+export async function readPayStoreBlob(): Promise<StoreFile> {
+  return readStore();
+}
+
+export async function writePayStoreBlob(store: StoreFile): Promise<void> {
+  await writeStore(store);
+}
+
+export async function mutatePayStoreBlob(mutator: (store: StoreFile) => void): Promise<StoreFile> {
+  const store = await readStore();
+  mutator(store);
+  await writeStore(store);
+  return store;
 }

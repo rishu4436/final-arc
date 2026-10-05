@@ -1,27 +1,19 @@
 "use client";
 
+import { proofAmountDisplay, proofStatusLabel, type ArcProofBody } from "@/lib/arcProof";
 import { explorerAddress, explorerTx, formatUsdc, shortAddr, shortHash } from "@/lib/format";
-import type { Certificate, CertCheck, ParsedReceipt } from "@/lib/receipt";
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 
-export function ReceiptCard({
-  parsed,
-  certificate,
-  certCheck,
-}: {
-  parsed: ParsedReceipt;
-  certificate: Certificate | null;
-  certCheck: CertCheck;
-}) {
+export function ReceiptCard({ proof }: { proof: ArcProofBody }) {
   const [copied, setCopied] = useState(false);
-  const stamp =
-    !parsed.transactionSucceeded
-      ? "Reverted"
-      : parsed.settlementValid
-        ? "Final"
-        : parsed.memoEventValid
-          ? "Memo only"
-          : "Not Memo";
+  const label = proofStatusLabel(proof.status);
+  const amount = proofAmountDisplay(proof);
+  const stampClass =
+    proof.status === "VERIFIED"
+      ? "text-[var(--ok)]"
+      : proof.status === "PARTIAL"
+        ? "text-[var(--muted)]"
+        : "text-[var(--stamp)]";
 
   async function copyLink() {
     try {
@@ -37,71 +29,103 @@ export function ReceiptCard({
     <article className="border border-[var(--line)] bg-[#fbf7ef] shadow-[0_12px_40px_rgba(22,19,16,0.08)]">
       <div className="flex items-start justify-between gap-4 px-6 pb-2 pt-6 sm:px-8">
         <div>
-          <p className="text-xs uppercase tracking-[0.22em] text-[var(--muted)]">Arc mainnet · 5042</p>
+          <p className="text-xs uppercase tracking-[0.22em] text-[var(--muted)]">FINAL · Arc · 5042</p>
           <h1 className="display mt-2 text-4xl">Receipt</h1>
+          <p className="mt-2 text-sm" role="status">
+            {label}
+          </p>
         </div>
-        <div className="stamp px-3 py-1 text-xs font-semibold">{stamp}</div>
+        <div className={`stamp px-3 py-1 text-xs font-semibold ${stampClass}`}>{label}</div>
       </div>
 
       <div className="perforation mx-2 my-3" />
 
       <div className="px-6 pb-8 sm:px-8">
-        {!parsed.transactionSucceeded ? (
-          <p className="mb-6 text-sm text-[var(--stamp)]">
-            This transaction reverted. It is not a successful settlement.
-          </p>
-        ) : !parsed.memoEventValid ? (
-          <p className="mb-6 text-sm text-[var(--stamp)]">
-            No valid Memo event was found. A transaction sent to the Memo contract
-            is not, by itself, a Final payment.
-          </p>
-        ) : !parsed.settlementValid ? (
-          <p className="mb-6 text-sm text-[var(--stamp)]">
-            A Memo event was found, but it is not bound to an exact USDC transfer.
-          </p>
-        ) : null}
+        <p className="text-sm text-[var(--muted)]">
+          {proof.status === "VERIFIED"
+            ? "The receipt succeeded, the Memo event is bound to one USDC transfer, and the certificate height and block hash match. Validator signatures are not cryptographically checked."
+            : proof.status === "PARTIAL"
+              ? "Memo and USDC settlement checked out. Certificate evidence is missing, so this is not Verified."
+              : "This transaction is not a verified Memo USDC payment."}
+        </p>
+        <p className="mt-3 text-sm text-[var(--muted)]">
+          Verified describes this Arc transaction. It does not mean a FINAL payment request is paid.
+        </p>
 
-        <p className="text-sm text-[var(--muted)]">Amount</p>
+        <p className="mt-6 text-sm text-[var(--muted)]">Amount</p>
         <p className="mono mt-1 text-4xl tracking-tight">
-          {formatUsdc(parsed.amount)}
+          {amount ? formatUsdc(amount) : "—"}
           <span className="ml-2 text-base text-[var(--muted)]">USDC</span>
         </p>
-        <p className="mt-1 text-xs text-[var(--muted)]">
-          One figure from the ERC-20 Transfer log. Native + token are never added.
-        </p>
 
-        <dl className="mt-8 grid gap-4 text-sm">
-          <Row label="Memo" value={parsed.memo ?? "—"} wide />
+        <Section title="Transaction">
+          <Row label="Status" value={proof.transaction.success ? "Succeeded" : "Reverted"} />
+          <Row label="From" value={shortAddr(proof.transaction.from)} href={explorerAddress(proof.transaction.from)} />
+          <Row
+            label="To"
+            value={proof.transaction.to ? shortAddr(proof.transaction.to) : "—"}
+            href={proof.transaction.to ? explorerAddress(proof.transaction.to) : undefined}
+          />
+          <Row label="Block" value={proof.transaction.blockNumber} />
+          <Row label="Block hash" value={proof.transaction.blockHash ? shortHash(proof.transaction.blockHash) : "—"} />
+          <Row label="Hash" value={shortHash(proof.transaction.txHash)} href={explorerTx(proof.transaction.txHash)} />
+        </Section>
+
+        <Section title="Memo">
+          <Row label="Valid" value={proof.memo.valid ? "Yes" : "No"} />
+          <Row label="Memo" value={proof.memo.memo ?? "—"} wide />
+          <Row label="Memo id" value={proof.memo.memoId ? shortHash(proof.memo.memoId) : "—"} />
+          <Row
+            label="Sender"
+            value={proof.memo.sender ? shortAddr(proof.memo.sender) : "—"}
+            href={proof.memo.sender ? explorerAddress(proof.memo.sender) : undefined}
+          />
+        </Section>
+
+        <Section title="USDC settlement">
+          <Row label="Valid" value={proof.settlement.valid ? "Yes" : "No"} />
+          <Row label="Amount" value={amount ? `${formatUsdc(amount)} USDC` : "—"} />
           <Row
             label="From"
-            value={shortAddr(parsed.sender ?? parsed.from)}
-            href={explorerAddress(parsed.sender ?? parsed.from)}
+            value={proof.settlement.from ? shortAddr(proof.settlement.from) : "—"}
+            href={proof.settlement.from ? explorerAddress(proof.settlement.from) : undefined}
           />
           <Row
             label="To"
-            value={parsed.to ? shortAddr(parsed.to) : "—"}
-            href={parsed.to ? explorerAddress(parsed.to) : undefined}
+            value={proof.settlement.to ? shortAddr(proof.settlement.to) : "—"}
+            href={proof.settlement.to ? explorerAddress(proof.settlement.to) : undefined}
           />
-          <Row label="Block" value={parsed.blockNumber} />
-          <Row label="Fee" value={`${formatUsdc(parsed.feeUsdc, 6)} USDC`} />
+        </Section>
+
+        <Section title="Certificate">
           <Row
-            label="Transaction"
-            value={shortHash(parsed.txHash)}
-            href={explorerTx(parsed.txHash)}
-            mono
+            label="Match"
+            value={
+              proof.certificate.matchesTransaction == null
+                ? "Unavailable"
+                : proof.certificate.matchesTransaction
+                  ? "Height and block hash match"
+                  : "Does not match"
+            }
           />
-        </dl>
+          <Row label="Height" value={proof.certificate.height == null ? "—" : String(proof.certificate.height)} />
+          <Row
+            label="Signatures"
+            value={
+              proof.certificate.signatureCount == null
+                ? "—"
+                : `${proof.certificate.signatureCount} listed, not checked`
+            }
+          />
+          <p className="text-xs text-[var(--muted)]">{proof.certificate.note}</p>
+        </Section>
 
         <div className="mt-6 flex flex-wrap gap-3">
-          <button
-            type="button"
-            onClick={copyLink}
-            className="border border-[var(--ink)] px-3 py-1.5 text-sm"
-          >
+          <button type="button" onClick={copyLink} className="border border-[var(--ink)] px-3 py-1.5 text-sm">
             {copied ? "Copied" : "Copy link"}
           </button>
           <a
-            href={explorerTx(parsed.txHash)}
+            href={explorerTx(proof.transaction.txHash)}
             target="_blank"
             rel="noreferrer"
             className="border border-[var(--line)] px-3 py-1.5 text-sm no-underline"
@@ -109,44 +133,17 @@ export function ReceiptCard({
             View on explorer
           </a>
         </div>
-
-        <div className="mt-10 border-t border-dashed border-[var(--line)] pt-6">
-          <p className="text-xs uppercase tracking-[0.18em] text-[var(--muted)]">
-            Block certificate
-          </p>
-          {certificate ? (
-            <div className="mt-3 space-y-2 text-sm">
-              <p>
-                Height {certificate.height} · round {certificate.round} ·{" "}
-                {certCheck.signatureCount} validator signatures listed ·{" "}
-                <span className={certCheck.matched ? "text-[var(--ok)]" : "text-[var(--stamp)]"}>
-                  {certCheck.matched ? "block hash matched" : "block hash mismatch"}
-                </span>
-                {certCheck.signaturesCryptographicallyVerified
-                  ? ""
-                  : " · signatures not checked"}
-              </p>
-              <p className="mono break-all text-xs text-[var(--muted)]">{certificate.block_hash}</p>
-              <p className="text-xs text-[var(--muted)]">{certCheck.note}</p>
-              <details className="mt-3">
-                <summary className="cursor-pointer text-xs text-[var(--muted)]">
-                  Show validator addresses
-                </summary>
-                <ul className="mt-2 max-h-48 space-y-1 overflow-auto text-xs">
-                  {certificate.signatures.map((sig) => (
-                    <li key={sig.address} className="mono break-all text-[var(--muted)]">
-                      {sig.address}
-                    </li>
-                  ))}
-                </ul>
-              </details>
-            </div>
-          ) : (
-            <p className="mt-3 text-sm text-[var(--muted)]">{certCheck.note}</p>
-          )}
-        </div>
       </div>
     </article>
+  );
+}
+
+function Section({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <section className="mt-8">
+      <h2 className="text-xs uppercase tracking-[0.18em] text-[var(--muted)]">{title}</h2>
+      <dl className="mt-3 grid gap-4 text-sm">{children}</dl>
+    </section>
   );
 }
 
@@ -155,13 +152,11 @@ function Row({
   value,
   href,
   wide,
-  mono,
 }: {
   label: string;
   value: string;
   href?: string;
   wide?: boolean;
-  mono?: boolean;
 }) {
   const inner = href ? (
     <a href={href} target="_blank" rel="noreferrer" className="underline decoration-[var(--line)]">
@@ -173,7 +168,7 @@ function Row({
   return (
     <div className="grid grid-cols-[7rem_1fr] gap-3 border-b border-[var(--line)] pb-3">
       <dt className="text-[var(--muted)]">{label}</dt>
-      <dd className={`${wide ? "" : "mono"} ${mono ? "mono" : ""} break-all`}>{inner}</dd>
+      <dd className={`${wide ? "" : "mono"} break-all`}>{inner}</dd>
     </div>
   );
 }
