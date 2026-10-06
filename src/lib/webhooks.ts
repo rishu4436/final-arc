@@ -1120,7 +1120,8 @@ async function deliverOnce(
 
 /**
  * Domain emit. Never throws to callers who use safeEmitWebhookEvent.
- * Does not emit payment.* or payment_request.expired.
+ * Does not emit payment.detected/verified/failed or payment_request.expired.
+ * payment.paid is emitted on real PAID transitions (Phase 14).
  * Durable: each matching endpoint gets a persisted pending row before HTTP.
  */
 export async function emitWebhookEvent(
@@ -1383,6 +1384,23 @@ export function emitPaymentRequestCancelled(row: PayRecord, deps?: WebhookDeps):
       type: "payment_request.cancelled",
       merchant: row.to,
       data: paymentRequestEventData(row),
+    },
+    deps,
+  );
+}
+
+/** Emit payment.paid after a real PAID transition. Safe no-op on failure. Prefer settleAndEnqueue for durable outbox-in-CAS. */
+export function emitPaymentPaid(row: PayRecord, deps?: WebhookDeps): void {
+  if (!row.paidTx) return;
+  safeEmitWebhookEvent(
+    {
+      type: "payment.paid",
+      merchant: row.to,
+      data: {
+        ...paymentRequestEventData(row),
+        paidTx: row.paidTx,
+        phase: "PAID",
+      },
     },
     deps,
   );

@@ -323,3 +323,68 @@ export async function findPaidTx(lookup: PaidLookup): Promise<Hash | null> {
   const proof = await findSettlementProof(lookup);
   return proof?.tx ?? null;
 }
+
+export type SubmittedProofResult =
+  | { status: "proof"; proof: PaidProof }
+  | { status: "not_found" }
+  | { status: "rpc_unavailable" }
+  | { status: "reverted" }
+  | { status: "mismatch" };
+
+/**
+ * Verify one submitted transaction hash against a payment lookup.
+ * Never marks PAID. V2 uses receipt + block (2 RPC). V1 uses receipt only (1 RPC).
+ * Pass cancelled:false on the lookup so payment-before-cancel can still verify;
+ * the store settle step enforces cancel ordering.
+ */
+export async function proofFromTransactionHash(
+  lookup: PaidLookup,
+  txHash: Hash,
+  client: {
+    getTransactionReceipt: (args: { hash: Hash }) => Promise<TransactionReceipt>;
+    getBlock: (args: { blockNumber: bigint }) => Promise<{ timestamp: bigint }>;
+  } = payClient,
+): Promise<SubmittedProofResult> {
+  if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) return { status: "mismatch" };
+  let receipt: TransactionReceipt;
+  try {
+    receipt = await client.getTransactionReceipt({ hash: txHash });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message.toLowerCase() : "";
+    // viem: TransactionReceiptNotFoundError / could not be found
+    if (msg.includes("could not be found") || msg.includes("not found") || msg.includes("receipt")) {
+      return { status: "not_found" };
+    }
+    return { status: "rpc_unavailable" };
+  }
+  if (!receipt) return { status: "not_found" };
+  if (receipt.status !== "success") return { status: "reverted" };
+
+  try {
+    if (isV2PaidLookup(lookup)) {
+      // Ignore store cancelled for verification; settleRecord decides supersede vs late.
+      const openLookup: V2PaidLookup = { ...lookup, cancelled: false };
+      if (payClient.chain?.id !== ARC_CHAIN_ID && client === payClient) {
+        return { status: "mismatch" };
+      }
+      let block: { timestamp: bigint };
+      try {
+        block = await client.getBlock({ blockNumber: receipt.blockNumber });
+      } catch {
+        return { status: "rpc_unavailable" };
+      }
+      const proof = await v2SettlementProof(openLookup, {
+        receipt,
+        blockTimestamp: block.timestamp,
+        chainId: ARC_CHAIN_ID,
+      });
+      if (!proof) return { status: "mismatch" };
+      return { status: "proof", proof };
+    }
+    const proof = v1SettlementProof(lookup, receipt);
+    if (!proof) return { status: "mismatch" };
+    return { status: "proof", proof };
+  } catch {
+    return { status: "rpc_unavailable" };
+  }
+}

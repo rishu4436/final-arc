@@ -24,10 +24,11 @@ export const WEBHOOK_EVENT_CATALOG = [
 
 export type WebhookEventType = (typeof WEBHOOK_EVENT_CATALOG)[number];
 
-/** payment.* and payment_request.expired are not emitted. Escrow events are emitted only after a real escrow transition. policy_denied is an audit event, not a payment. */
+/** payment.detected/verified/failed and payment_request.expired are not emitted. payment.paid is emitted exactly once on a real PAID transition (Phase 14). Escrow events are emitted only after a real escrow transition. policy_denied is an audit event, not a payment. */
 export const EMITTABLE_WEBHOOK_EVENTS = [
   "payment_request.created",
   "payment_request.cancelled",
+  "payment.paid",
   "webhook.test",
   "escrow.created",
   "escrow.opened",

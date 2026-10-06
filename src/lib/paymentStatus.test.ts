@@ -155,25 +155,28 @@ function assertSafe(body: unknown) {
   assert.deepEqual(body, { error: PAYMENT_STATUS_UNAVAILABLE });
 }
 
-test("no settlement stays unpaid", async () => {
+test("Phase 14: GET token read is pure and stays unpaid without reconcile", async () => {
   const token = encodePayRequest({ to: MERCHANT, amount: "0.2", memo: "note" });
   const { store, calls } = deps({ records: [row(token)] });
   const result = await payGet(get(`http://localhost/api/pay?token=${encodeURIComponent(token)}`), store);
   assert.equal(result.status, 200);
   assert.equal("record" in result.body && result.body.record.paidTx, null);
   assert.equal(calls.paid, 0);
-  assert.equal(calls.find, 1);
+  assert.equal(calls.find, 0);
 });
 
-test("a settlement is recorded as paid", async () => {
+test("Phase 14: GET does not record settlement even when find would succeed", async () => {
   const token = encodePayRequest({ to: MERCHANT, amount: "0.2", memo: "note" });
-  const { store } = deps({ records: [row(token)], find: async () => proof() });
+  const { store, calls, current } = deps({ records: [row(token)], find: async () => proof() });
   const result = await payGet(get(`http://localhost/api/pay?token=${encodeURIComponent(token)}`), store);
   assert.equal(result.status, 200);
-  assert.equal("record" in result.body && result.body.record.paidTx, TX);
+  assert.equal("record" in result.body && result.body.record.paidTx, null);
+  assert.equal(current(token)?.paidTx, null);
+  assert.equal(calls.find, 0);
+  assert.equal(calls.paid, 0);
 });
 
-test("an RPC failure is 503 and not an unpaid record", async () => {
+test("Phase 14: GET ignores RPC-capable find failures (pure read)", async () => {
   const token = encodePayRequest({ to: MERCHANT, amount: "0.2", memo: "note" });
   const { store, calls, current } = deps({
     records: [row(token)],
@@ -182,13 +185,11 @@ test("an RPC failure is 503 and not an unpaid record", async () => {
     },
   });
   const result = await payGet(get(`http://localhost/api/pay?token=${encodeURIComponent(token)}`), store);
-  assert.equal(result.status, 503);
-  assert.equal("record" in result.body, false);
-  assertSafe(result.body);
+  assert.equal(result.status, 200);
+  assert.equal("record" in result.body && result.body.record.paidTx, null);
   assert.equal(current(token)?.paidTx, null);
-  assert.equal(current(token)?.cancelled, false);
+  assert.equal(calls.find, 0);
   assert.equal(calls.paid, 0);
-  assert.equal(calls.cancelled, 0);
 });
 
 test("a Redis read failure is 503 and not an unpaid record", async () => {
@@ -200,7 +201,7 @@ test("a Redis read failure is 503 and not an unpaid record", async () => {
   assert.equal(calls.find, 0);
 });
 
-test("a Redis write failure is 503 and not an unpaid record", async () => {
+test("Phase 14: GET does not write even when find would return a proof", async () => {
   const token = encodePayRequest({ to: MERCHANT, amount: "0.2", memo: "note" });
   const { store, calls, current } = deps({
     records: [row(token)],
@@ -208,11 +209,10 @@ test("a Redis write failure is 503 and not an unpaid record", async () => {
     failWrite: true,
   });
   const result = await payGet(get(`http://localhost/api/pay?token=${encodeURIComponent(token)}`), store);
-  assert.equal(result.status, 503);
-  assertSafe(result.body);
+  assert.equal(result.status, 200);
   assert.equal(current(token)?.paidTx, null);
-  assert.equal(calls.paid, 1);
-  assert.equal(calls.cancelled, 0);
+  assert.equal(calls.paid, 0);
+  assert.equal(calls.find, 0);
 });
 
 test("an already paid row stays paid when a later scan would fail", async () => {
@@ -298,22 +298,22 @@ test("a V1 link with no settlement stays unpaid", async () => {
   assert.equal(calls.paid, 0);
 });
 
-test("a cancellation scan failure is 503 and does not cancel", async () => {
-  const request = v2Request();
-  const token = encodeV2PayRequest(request);
+test("Phase 14: cancel does not scan so find failure cannot 503 cancel", async () => {
+  const token = encodePayRequest({ to: MERCHANT, amount: "0.2", memo: "note" });
   const { store, calls, current } = deps({
-    records: [row(token, { id: REQUEST_A, amount: "0.2", memo: request.memo })],
+    records: [row(token)],
     find: async () => {
       throw new Error(LEAK);
     },
   });
-  const signature = await signPaymentCancellation(request, MERCHANT_KEY);
-  const result = await payPost(post({ token, action: "cancel", signature }), store);
-  assert.equal(result.status, 503);
-  assertSafe(result.body);
-  assert.equal(calls.cancelled, 0);
-  assert.equal(current(token)?.cancelled, false);
-  assert.equal(current(token)?.paidTx, null);
+  const result = await payPost(
+    post({ token, action: "cancel", address: MERCHANT }),
+    store,
+  );
+  assert.equal(result.status, 200);
+  assert.equal(current(token)?.cancelled, true);
+  assert.equal(calls.find, 0);
+  assert.equal(calls.cancelled, 1);
 });
 
 test("a null cancellation scan still cancels", async () => {
@@ -331,40 +331,32 @@ test("a null cancellation scan still cancels", async () => {
   assert.equal(calls.cancelled, 1);
 });
 
-test("a settlement found during cancellation is paid and not cancelled", async () => {
-  const request = v2Request();
-  const token = encodeV2PayRequest(request);
-  const paid = {
-    version: 2 as const,
-    tx: TX,
-    requestId: REQUEST_A,
-    blockTimestamp: 1_800_000_000,
-    expiresAt: request.expiresAt,
-  };
-  const { store, calls } = deps({
-    records: [row(token, { id: REQUEST_A, amount: "0.2", memo: request.memo })],
-    find: async () => paid,
+test("Phase 14: cancel does not credit settlement found during cancel", async () => {
+  const token = encodePayRequest({ to: MERCHANT, amount: "0.2", memo: "note" });
+  const { store, calls, current } = deps({
+    records: [row(token)],
+    find: async () => proof(),
   });
-  const signature = await signPaymentCancellation(request, MERCHANT_KEY);
-  const result = await payPost(post({ token, action: "cancel", signature }), store);
+  const result = await payPost(post({ token, action: "cancel", address: MERCHANT }), store);
   assert.equal(result.status, 200);
-  assert.equal("record" in result.body && result.body.record.paidTx, TX);
-  assert.equal("record" in result.body && result.body.record.cancelled, false);
-  assert.equal(calls.cancelled, 0);
+  assert.equal(current(token)?.cancelled, true);
+  assert.equal(current(token)?.paidTx, null);
+  assert.equal(calls.find, 0);
+  assert.equal(calls.paid, 0);
 });
 
-test("one failed settlement scan does not return an unpaid payee list", async () => {
+test("Phase 14: merchant list is pure even if find would throw", async () => {
   const token = encodePayRequest({ to: MERCHANT, amount: "0.2", memo: "note" });
-  const { store } = deps({
+  const { store, calls } = deps({
     records: [row(token)],
     find: async () => {
       throw new Error(LEAK);
     },
   });
   const result = await payGet(get(`http://localhost/api/pay?to=${MERCHANT}`), store);
-  assert.equal(result.status, 503);
-  assert.equal("records" in result.body, false);
-  assertSafe(result.body);
+  assert.equal(result.status, 200);
+  assert.equal("records" in result.body && result.body.records.length, 1);
+  assert.equal(calls.find, 0);
 });
 
 test("a statement ledger failure is 503 and not an empty authoritative list", async () => {
@@ -381,7 +373,7 @@ test("a statement ledger failure is 503 and not an empty authoritative list", as
   assert.equal(calls.find, 0);
 });
 
-test("a statement settlement failure is 503 and does not mark the link unpaid", async () => {
+test("Phase 14: statement does not reconcile payment rows", async () => {
   const token = encodePayRequest({ to: MERCHANT, amount: "0.2", memo: "note" });
   const { store, calls, current } = deps({
     records: [row(token)],
@@ -390,10 +382,9 @@ test("a statement settlement failure is 503 and does not mark the link unpaid", 
     },
   });
   const result = await statementGet(get(`http://localhost/api/statement?address=${MERCHANT}`), store);
-  assert.equal(result.status, 503);
-  assert.equal("links" in result.body, false);
-  assertSafe(result.body);
+  assert.equal(result.status, 200);
   assert.equal(current(token)?.paidTx, null);
+  assert.equal(calls.find, 0);
   assert.equal(calls.paid, 0);
 });
 

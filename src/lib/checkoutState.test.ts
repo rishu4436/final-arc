@@ -316,5 +316,5 @@ test("checkout modules do not reconcile, mark paid, or carry secrets", () => {
   assert.doesNotMatch(source, /final_live_|BEGIN PRIVATE KEY|webhookSecret|whsec_/);
   assert.match(checkout, /\/api\/pay\/observe\?token=/);
   assert.doesNotMatch(checkout, /\/api\/pay\?token=/);
-  assert.doesNotMatch(checkout, /fetch\("\/api\/pay"/);
+  assert.match(checkout, /action:\s*"submit"/);
 });

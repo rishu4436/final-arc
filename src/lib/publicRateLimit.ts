@@ -35,10 +35,14 @@ export type RateRule = {
  * minute per merchant. Statement scans the Memo ledger on Arc, so it is lowest.
  */
 export const LEGACY_RATE_RULES = {
-  /** GET /api/pay?token= (public; reconciles one existing row). */
+  /** GET /api/pay?token= (public; stored row only — no reconciliation). */
   "pay.token_read": { perKey: 30, global: 600, windowSeconds: 60 },
-  /** POST /api/pay register / view / cancel (public entry; cancel may scan one V2 request). */
+  /** POST /api/pay register / view / cancel (public entry; cancel does not scan). */
   "pay.write": { perKey: 30, global: 600, windowSeconds: 60 },
+  /** POST /api/pay action=submit (public; ≤2 RPC verify). Keyed by IP + token fingerprint. */
+  "pay.submit": { perKey: 20, global: 400, windowSeconds: 60 },
+  /** POST /api/pay action=reconcile (authenticated; single-row). Keyed by merchant. */
+  "pay.reconcile": { perKey: 12, global: 120, windowSeconds: 60 },
   /** GET /api/pay?to= before authentication, keyed by client IP. */
   "pay.list_ip": { perKey: 30, global: 600, windowSeconds: 60 },
   /** GET /api/pay?to= after authentication, keyed by authenticated merchant. */

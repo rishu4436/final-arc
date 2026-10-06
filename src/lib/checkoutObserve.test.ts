@@ -195,7 +195,8 @@ test("observe source never reconciles, marks paid, or emits webhooks", () => {
   assert.match(route, /getRecord/);
   assert.match(checkout, /\/api\/pay\/observe\?token=/);
   assert.doesNotMatch(checkout, /\/api\/pay\?token=/);
-  assert.doesNotMatch(checkout, /fetch\("\/api\/pay"/);
+  // Phase 14: Checkout POSTs action=submit with the wallet hash (never GET reconcile).
+  assert.match(checkout, /action:\s*"submit"/);
   assert.equal(checkout.includes("reconcilePaymentRecord"), false);
   assert.equal(checkout.includes("markPaid"), false);
 });

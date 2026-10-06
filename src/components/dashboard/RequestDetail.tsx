@@ -11,9 +11,12 @@ import {
   shareTargets,
   type PublicReceiptFacts,
 } from "@/lib/merchantDashboard";
+import { WALLET_ACTIONS } from "@/lib/apiScopes";
 import { cancelOffer } from "@/lib/payRequest";
+import { cachedWalletHeaders } from "@/lib/walletAuthCache";
 import Link from "next/link";
 import { useEffect, useState } from "react";
+import { useSignMessage } from "wagmi";
 
 function Field({ label, value }: { label: string; value: string | null }) {
   if (!value) return null;
@@ -31,6 +34,7 @@ function yesNo(value: boolean): string {
 
 export function RequestDetail({ token }: { token: string }) {
   const { model, loading, error, refresh, address } = useMerchantData();
+  const { signMessageAsync } = useSignMessage();
   const lookup = lookupWorkspaceRequest(model, token);
   const row = lookup.state === "found" ? lookup.row : null;
   const [facts, setFacts] = useState<PublicReceiptFacts | null>(null);
@@ -41,6 +45,8 @@ export function RequestDetail({ token }: { token: string }) {
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
   const [offer, setOffer] = useState<"legacy" | "v2" | null>(null);
+  const [reconcileBusy, setReconcileBusy] = useState(false);
+  const [reconcileError, setReconcileError] = useState<string | null>(null);
 
   useEffect(() => {
     setCanShare(typeof navigator !== "undefined" && typeof navigator.share === "function");
@@ -104,6 +110,39 @@ export function RequestDetail({ token }: { token: string }) {
       setCopied(label);
     } catch {
       setCopied(null);
+    }
+  }
+
+  async function checkPayment() {
+    if (!row || !address || reconcileBusy) return;
+    setReconcileBusy(true);
+    setReconcileError(null);
+    const bodyText = JSON.stringify({ action: "reconcile", token: row.token });
+    try {
+      const headers = await cachedWalletHeaders(
+        WALLET_ACTIONS.paymentsRegister,
+        address,
+        (args) => signMessageAsync(args),
+        { method: "POST", path: "/api/pay", body: bodyText },
+      );
+      const res = await fetch("/api/pay", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...headers },
+        body: bodyText,
+      });
+      const body = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok) {
+        setReconcileError(
+          presentWorkspaceError(typeof body.error === "string" ? body.error : null) ??
+            "Could not check payment status.",
+        );
+        return;
+      }
+      refresh();
+    } catch {
+      setReconcileError("Could not check payment status.");
+    } finally {
+      setReconcileBusy(false);
     }
   }
 
@@ -198,7 +237,20 @@ export function RequestDetail({ token }: { token: string }) {
           {facts?.transactionFrom ? <Field label="Transaction sender" value={facts.transactionFrom} /> : null}
         </dl>
         {!row.paidTx ? (
-          <p className="mt-3 text-sm text-[var(--muted)]">No settled transaction recorded.</p>
+          <div className="mt-3">
+            <p className="text-sm text-[var(--muted)]">No settled transaction recorded.</p>
+            {row.status !== "PAID" ? (
+              <button
+                type="button"
+                className="mt-3 border border-[var(--ink)] px-3 py-1.5 text-sm"
+                disabled={reconcileBusy}
+                onClick={() => void checkPayment()}
+              >
+                {reconcileBusy ? "Checking…" : "Check payment"}
+              </button>
+            ) : null}
+            {reconcileError ? <p className="mt-2 text-sm text-[var(--stamp)]">{reconcileError}</p> : null}
+          </div>
         ) : null}
         {row.status === "PAID" && !row.paidTx ? (
           <p className="mt-2 text-sm text-[var(--muted)]">

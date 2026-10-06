@@ -133,9 +133,19 @@ export function Checkout({ token }: { token: string }) {
 
   useEffect(() => {
     const stored = sessionStorage.getItem(`final-checkout-submitted:${token}`);
-    if (stored && /^0x[0-9a-fA-F]{64}$/.test(stored)) setSubmittedHash(stored);
+    if (stored && /^0x[0-9a-fA-F]{64}$/.test(stored)) {
+      setSubmittedHash(stored);
+      // Re-announce a previously submitted hash after refresh (no second wallet tx).
+      void fetch("/api/pay", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "submit", token, txHash: stored }),
+      })
+        .then(() => pullStatus())
+        .catch(() => undefined);
+    }
     setCanShare(typeof navigator.share === "function");
-  }, [token]);
+  }, [token, pullStatus]);
 
   useEffect(() => {
     void pullStatus();
@@ -307,6 +317,37 @@ export function Checkout({ token }: { token: string }) {
       sessionStorage.setItem(`final-checkout-submitted:${token}`, presented.hash);
       setFlow("submitted");
       setFlowDetail(null);
+      // Phase 14: tell the server the hash so PAID does not depend on GET reconciliation.
+      // Never send a second wallet transaction — only POST the hash (bounded retries on RPC fail).
+      void (async () => {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            const res = await fetch("/api/pay", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ action: "submit", token, txHash: presented.hash }),
+            });
+            const body = (await res.json().catch(() => ({}))) as {
+              record?: { paidTx?: string | null };
+              error?: string;
+              code?: string;
+            };
+            if (res.ok && body.record?.paidTx) {
+              await pullStatus();
+              return;
+            }
+            if (res.status === 503 || body.code === "rpc_unavailable") {
+              await new Promise((r) => window.setTimeout(r, 1500 * (attempt + 1)));
+              continue;
+            }
+            // Candidate accepted or mismatch — keep submitted UI; observe poll will pick up PAID later.
+            await pullStatus();
+            return;
+          } catch {
+            await new Promise((r) => window.setTimeout(r, 1500 * (attempt + 1)));
+          }
+        }
+      })();
       return;
     }
     setFlow("error");

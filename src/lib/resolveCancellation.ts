@@ -1,23 +1,25 @@
 import { decideCancellation, type CancelDecision } from "./finalCancel";
 import { isV2PaidLookup, type PaidLookup, type PayIdentity } from "./payPaid";
-import type { CancelCommand, PaidProof, PayRecord } from "./payStore";
+import type { CancelCommand, PayRecord } from "./payStore";
 
 export type CancelResolution =
   | { ok: false; status: number; error: string }
   | { ok: true; record: PayRecord; notify: "paid" | "cancelled" | null };
 
 /**
- * Store and chain ports used by the cancel route.
- * The settlement function is the existing finder. This module does not
- * reimplement receipt rules.
+ * Store ports used by the cancel route.
+ * Phase 14: cancellation does NOT scan the chain. Settlement discovery is
+ * submit / merchant reconcile. Payment-before-cancel is enforced later when
+ * a proof with blockTimestamp < cancelledAtSeconds is applied.
  */
 export type CancellationDeps = {
   getRecord: (token: string) => Promise<PayRecord | null>;
-  markPaid: (token: string, proof: PaidProof) => Promise<PayRecord | null>;
   markCancelled: (token: string, command: CancelCommand) => Promise<PayRecord | null>;
-  findSettlementProof: (lookup: PaidLookup) => Promise<PaidProof | null>;
-  /** Insert the open row when a proof exists but the link was never registered. */
-  ensureRecord: () => Promise<PayRecord>;
+  /** @deprecated Phase 14 cancel does not mark paid or scan. Accepted and ignored. */
+  markPaid?: (token: string, proof: import("./payStore").PaidProof) => Promise<PayRecord | null>;
+  /** @deprecated Phase 14 cancel does not scan. Accepted and ignored. */
+  findSettlementProof?: (lookup: PaidLookup) => Promise<import("./payStore").PaidProof | null>;
+  ensureRecord?: () => Promise<PayRecord>;
 };
 
 function expiredDecision(decision: CancelDecision): boolean {
@@ -25,19 +27,9 @@ function expiredDecision(decision: CancelDecision): boolean {
 }
 
 /**
- * A valid on-chain settlement wins over cancellation.
- * Authorization is decideCancellation, unchanged. A failed authorization
- * does not scan, except an expired V2 request: an in-time settlement
- * (block timestamp already checked by the existing finder) is returned
- * as PAID instead of 409. No settlement still returns that 409, and the
- * row is not cancelled.
- *
- * Already-cancelled rows are not revived. Already-paid rows are returned
- * unchanged.
- *
- * Not atomic. findSettlementProof and markCancelled are separate steps.
- * A settlement that lands after a null scan, or another writer, can still
- * change the row. Redis REST has no compare-and-set. This does not claim one.
+ * Authorize via decideCancellation, then persist cancel with cancelledAtSeconds.
+ * No chain scan. Already-paid rows are returned unchanged (notify null).
+ * Already-cancelled rows are returned unchanged.
  */
 export async function resolveCancellation(
   input: {
@@ -61,39 +53,16 @@ export async function resolveCancellation(
   });
 
   if (!decision.ok) {
-    if (expiredDecision(decision) && request) {
-      const credited = await creditInTimeSettlement(input.token, request, deps);
-      if (credited) return credited;
+    // Expired V2: do not cancel; do not scan. Caller may still have an in-time
+    // settlement discoverable via submit/reconcile.
+    if (expiredDecision(decision)) {
+      const existing = await deps.getRecord(input.token);
+      if (existing?.paidTx) return { ok: true, record: existing, notify: null };
     }
     return { ok: false, status: decision.status, error: decision.error };
   }
 
-  if (decision.version === 2 && request) {
-    const credited = await creditInTimeSettlement(input.token, request, deps);
-    if (credited) return credited;
-  }
-
-  // Null scan, then cancel. A settlement mined in this gap is not seen.
-  // That race remains. Do not treat this write as atomic with the chain.
   return commitCancellation(input.token, decision, deps);
-}
-
-async function creditInTimeSettlement(
-  token: string,
-  request: Extract<PaidLookup, { version: 2 }>["request"],
-  deps: CancellationDeps,
-): Promise<CancelResolution | null> {
-  const row = await deps.getRecord(token);
-  if (row?.cancelled) return null;
-  if (row?.paidTx) return { ok: true, record: row, notify: null };
-  const proof = await deps.findSettlementProof({ version: 2, request, cancelled: false });
-  if (!proof) return null;
-  if (!row) await deps.ensureRecord();
-  const paid = await deps.markPaid(token, proof);
-  if (!paid?.paidTx) {
-    throw new Error("Payment settlement could not be recorded.");
-  }
-  return { ok: true, record: paid, notify: "paid" };
 }
 
 async function commitCancellation(
@@ -101,6 +70,10 @@ async function commitCancellation(
   decision: Extract<CancelDecision, { ok: true }>,
   deps: CancellationDeps,
 ): Promise<CancelResolution> {
+  const existing = await deps.getRecord(token);
+  if (existing?.paidTx) return { ok: true, record: existing, notify: null };
+  if (existing?.cancelled) return { ok: true, record: existing, notify: null };
+
   const command: CancelCommand =
     decision.version === 1
       ? { version: 1, payee: decision.payee }
@@ -110,6 +83,13 @@ async function commitCancellation(
           nowSeconds: decision.nowSeconds,
           expiresAt: decision.expiresAt,
         };
+
+  // Ensure row exists for V2 cancel of an unregistered-but-signed link only when
+  // the caller provided ensureRecord (legacy behavior). Prefer registered rows.
+  if (!existing && deps.ensureRecord) {
+    await deps.ensureRecord();
+  }
+
   const row = await deps.markCancelled(token, command);
   if (!row) {
     return {
@@ -122,5 +102,13 @@ async function commitCancellation(
     };
   }
   if (row.paidTx) return { ok: true, record: row, notify: null };
+  if (!row.cancelled) {
+    // Derived-expired V2 refuse-to-cancel path.
+    return {
+      ok: false,
+      status: 409,
+      error: "Payment request has expired.",
+    };
+  }
   return { ok: true, record: row, notify: "cancelled" };
 }

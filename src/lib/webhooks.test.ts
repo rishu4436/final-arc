@@ -402,16 +402,18 @@ test("bounded retries then failed", async () => {
   });
 });
 
-test("payment.paid is not emitted", async () => {
+test("payment.paid is emittable (Phase 14)", async () => {
   await withStore(async ({ deps }) => {
-    await assert.rejects(
-      () =>
-        emitWebhookEvent(
-          { type: "payment.paid" as "payment_request.created", merchant: MERCHANT, data: {} },
-          deps,
-        ),
-      /not emitted/,
+    await createWebhookEndpoint(
+      { merchant: MERCHANT, url: "https://hooks.example.com/final", events: ["payment.paid"] },
+      deps,
     );
+    const result = await emitWebhookEvent(
+      { type: "payment.paid", merchant: MERCHANT, data: { paidTx: "0x" + "ab" * 32 } },
+      deps,
+    );
+    assert.equal(typeof result.eventId, "string");
+    assert.equal(result.deliveries.length, 1);
   });
 });
 

@@ -24,7 +24,7 @@ import { loadReceipt, type LoadedReceipt } from "./loadReceipt";
 import { payRecordIdentity } from "./payPaid";
 import { decodePayLink, paymentLinkPhase, sealSignedV2Request, type PayLinkPhase } from "./payRequest";
 import { isTxHash } from "./receipt";
-import { createPayRecord, listRecords, upsertRecord, type PayRecord } from "./payStore";
+import { DuplicateRequestError, createPayRecord, listRecords, upsertRecord, type PayRecord } from "./payStore";
 import { LIMIT_EXCEEDED_CODE, ResourceLimitExceededError } from "./resourceLimits";
 import { emitPaymentRequestCreated } from "./webhooks";
 
@@ -550,6 +550,9 @@ export async function createPaymentRequest(
     } catch (err) {
       if (err instanceof ResourceLimitExceededError) {
         fail(409, LIMIT_EXCEEDED_CODE, err.message);
+      }
+      if (err instanceof DuplicateRequestError) {
+        fail(409, "duplicate_request", err.message);
       }
       fail(503, API_ERROR_CODES.storeUnavailable, "Payment store is unavailable.");
     }

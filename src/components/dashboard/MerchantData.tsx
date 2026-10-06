@@ -40,7 +40,7 @@ export function MerchantDataProvider({ children }: { children: ReactNode }) {
   const ready = mounted && isConnected && typeof address === "string" && isAddress(address);
   const merchant = ready ? address : null;
   // Phase 12: /dashboard/analytics reads only the read-only analytics API. The shared
-  // payment-list fetch (which reconciles) is not issued while that page is open.
+  // payment-list fetch is not issued while that page is open.
   const pathname = usePathname();
   const skipPaymentList = pathname === "/dashboard/analytics";
   const [model, setModel] = useState<DashboardModel>(() => emptyDashboard(true));

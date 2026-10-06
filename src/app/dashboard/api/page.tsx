@@ -54,8 +54,9 @@ export default function DeveloperApiPage() {
       <p className="mt-4 text-sm text-[var(--muted)]">
         Payment and receipt URLs use {originNote}, then the existing <span className="mono">/p/&lt;token&gt;</span> and{" "}
         <span className="mono">/r/&lt;tx&gt;</span> paths. Lookup by request id reads the current payment store.{" "}
-        <span className="mono">payment.paid</span> webhooks do not fire yet. Reconciliation is not enabled. An unpaid
-        row stays <span className="mono">OPEN</span> until that row already has a settlement.
+        <span className="mono">payment.paid</span> fires exactly once when a request becomes{" "}
+        <span className="mono">PAID</span> (submitted-hash verify or merchant reconcile). Ordinary payment GETs do not
+        reconcile. An unpaid row stays <span className="mono">OPEN</span> until settlement is verified.
       </p>
 
       <ApiKeysPanel />

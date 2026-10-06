@@ -502,11 +502,11 @@ test("P1-03 #7/#8: V1 and V2 public observation still work and never create a re
   assert.equal(box.calls.write, 0);
   assert.equal(box.calls.find, 0);
 
-  // Existing V1 row: token read still answers publicly (one-row reconcile, unchanged).
+  // Phase 14: Existing V1 row token read is pure (zero reconciliation RPC).
   const seeded = memoryDeps([row(v1, A.address)]);
   const read = await payGet(get(`http://localhost/api/pay?token=${encodeURIComponent(v1)}`), seeded.deps);
   assert.equal(read.status, 200);
-  assert.equal(seeded.calls.find, 1);
+  assert.equal(seeded.calls.find, 0);
   // Checkout observe route source is still read-only.
   const observeImports = src("src/app/api/pay/observe/route.ts")
     .split("\n")
@@ -840,6 +840,10 @@ test("P1-05 #24: /api/receipt/[hash] stays public chain proof — no store, no p
 
 test("P1-05 #24/#25: /api/receipt is rate limited per client per process", async () => {
   legacyRateLimiter.reset();
+  // Force file pay-store backend so the shared Redis rate-limit counter is not consulted
+  // (that bucket is shared across all local callers as ip:untrusted-proxy).
+  const prevStore = process.env.FINAL_PAY_STORE;
+  process.env.FINAL_PAY_STORE = join(tmpdir(), "final-receipt-rate-limit-force-file.json");
   try {
     const { GET } = await import("../app/api/receipt/[hash]/route");
     const ctx = { params: Promise.resolve({ hash: "0x12" }) };
@@ -851,6 +855,8 @@ test("P1-05 #24/#25: /api/receipt is rate limited per client per process", async
     assert.equal(limited.status, 429);
   } finally {
     legacyRateLimiter.reset();
+    if (prevStore === undefined) delete process.env.FINAL_PAY_STORE;
+    else process.env.FINAL_PAY_STORE = prevStore;
   }
 });
 
@@ -985,10 +991,14 @@ test("analytics and checkout isolation are unchanged; dashboard callers send wal
   assert.doesNotMatch(checkout, /action: "register"|action: "view"/);
 });
 
-test("reconciliation algorithm is untouched: legacy routes call the same helpers unchanged", () => {
+test("Phase 14: legacy GETs are pure; submit/reconcile own settlement", () => {
   const legacy = src("src/lib/payStatusHttp.ts");
-  assert.match(legacy, /reconcilePaymentRecord\(row, \{\s*findSettlementProof: deps\.findSettlementProof,\s*markPaid: deps\.markPaid,\s*\}\)/);
+  assert.doesNotMatch(legacy, /withPaid|reconcilePaymentRecord\(/);
+  assert.match(legacy, /submitTransactionHash|submitHash/);
+  assert.match(legacy, /reconcileOnePayment|reconcileOne/);
   assert.match(legacy, /resolveCancellation\(/);
+  assert.match(legacy, /action === "submit"/);
+  assert.match(legacy, /action === "reconcile"/);
   for (const file of ["src/lib/publicRateLimit.ts", "src/lib/resourceLimits.ts", "src/lib/walletAuthCache.ts", "src/lib/legacyLinkSync.ts"]) {
     const text = src(file);
     assert.doesNotMatch(text, /reconcilePaymentRecord|markPaid|findSettlementProof|emitWebhookEvent|writePayStoreBlob|mutatePayStoreBlob|createPublicClient|signTypedData|sendTransaction|privateKey/, file);

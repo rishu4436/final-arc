@@ -39,9 +39,44 @@ export type PayRecord = {
   lastViewedAt: string | null;
   cancelled: boolean;
   cancelledAt: string | null;
+  /**
+   * Unix seconds when cancellation was recorded (Phase 14).
+   * Compared to settlement blockTimestamp for payment-before-cancel.
+   * Optional on historical rows; missing means cancel time is unknown → cannot supersede.
+   */
+  cancelledAtSeconds?: number | null;
   paidTx: Hash | null;
+  /** Settlement block timestamp (unix seconds) when paid. Optional on historical rows. */
+  paidBlockTimestamp?: number | null;
+  /**
+   * Candidate transaction hashes submitted by the payer (Phase 14).
+   * At most MAX_SUBMITTED_HASHES. A hash alone never means PAID.
+   */
+  submittedHashes?: Hash[];
+  /**
+   * A transaction that matched the request but was mined at/after cancellation.
+   * Row stays CANCELLED. Informational only.
+   */
+  lateSettlementTx?: Hash | null;
   webhookUrl: string | null;
 };
+
+/** Cap on persisted submitted-hash candidates per payment row. */
+export const MAX_SUBMITTED_HASHES = 3;
+
+/**
+ * Thrown inside createPayRecord when another row already owns this (merchant, requestId).
+ * Distinct from capacity limits.
+ */
+export class DuplicateRequestError extends Error {
+  readonly status = 409 as const;
+  readonly code = "duplicate_request";
+
+  constructor(message = "A payment request with this requestId already exists.") {
+    super(message);
+    this.name = "DuplicateRequestError";
+  }
+}
 
 /** Optional webhooks section. Old blobs omit it. Payment list APIs never return it. */
 export type WebhookStoreSection = {
@@ -227,10 +262,20 @@ function preserveDurableFlags(current: StoreFile, outgoing: StoreFile): void {
       if (stored.paidTx || stored.cancelled) outgoing.records[token] = stored;
       continue;
     }
-    if (stored.paidTx && !next.paidTx) next.paidTx = stored.paidTx;
-    if (stored.cancelled && !next.cancelled) {
+    // paidTx is immutable once set — never clear or replace via preserve path.
+    if (stored.paidTx && !next.paidTx) {
+      next.paidTx = stored.paidTx;
+      if (stored.paidBlockTimestamp != null && next.paidBlockTimestamp == null) {
+        next.paidBlockTimestamp = stored.paidBlockTimestamp;
+      }
+    }
+    if (stored.cancelled && !next.cancelled && !next.paidTx) {
       next.cancelled = true;
       next.cancelledAt = stored.cancelledAt;
+      if (stored.cancelledAtSeconds != null) next.cancelledAtSeconds = stored.cancelledAtSeconds;
+    }
+    if (stored.lateSettlementTx && !next.lateSettlementTx) {
+      next.lateSettlementTx = stored.lateSettlementTx;
     }
   }
 }
@@ -540,31 +585,72 @@ export function mergePayRecord(existing: PayRecord | undefined, incoming: PayRec
 
 /**
  * First valid settlement wins. A second hash, even a valid one, does not replace it.
- * CANCELLED and a V2 settlement at or after expiry do not become PAID.
- * V2 requires the verified request id. This function does not check signatures.
+ * V2 requires the verified request id and blockTimestamp < expiresAt.
+ * Phase 14 payment-before-cancel: a CANCELLED V2 row may become PAID when
+ * proof.blockTimestamp < cancelledAtSeconds. Equal timestamps are NOT before.
+ * V1 cancelled rows cannot be superseded (no block timestamp on V1 proofs).
+ * This function does not check signatures or cross-row tx reuse.
  */
 export function nextPaidRecord(row: PayRecord, proof: PaidProof): PayRecord | null {
   if (row.paidTx) return row;
-  if (row.cancelled) return null;
   if (proof.version === 2) {
     if (!isV2RequestId(row.id) || !sameId(row.id, proof.requestId)) return null;
     if (!Number.isSafeInteger(proof.blockTimestamp) || !Number.isSafeInteger(proof.expiresAt)) return null;
     if (proof.blockTimestamp < 0 || proof.expiresAt < 0) return null;
     if (proof.blockTimestamp >= proof.expiresAt) return null;
-  } else if (isV2RequestId(row.id)) {
-    return null;
+    if (row.cancelled) {
+      const cancelAt = row.cancelledAtSeconds;
+      if (cancelAt == null || !Number.isSafeInteger(cancelAt) || proof.blockTimestamp >= cancelAt) {
+        return null;
+      }
+      return {
+        ...row,
+        paidTx: proof.tx,
+        paidBlockTimestamp: proof.blockTimestamp,
+        cancelled: false,
+        cancelledAt: null,
+      };
+    }
+    return { ...row, paidTx: proof.tx, paidBlockTimestamp: proof.blockTimestamp };
   }
+  if (isV2RequestId(row.id)) return null;
+  if (row.cancelled) return null;
   return { ...row, paidTx: proof.tx };
+}
+
+/** True when a V2 proof is a late settlement against a cancelled row (mined at/after cancel). */
+export function isLateSettlement(row: PayRecord, proof: PaidProof): boolean {
+  if (!row.cancelled || row.paidTx) return false;
+  if (proof.version !== 2) return false;
+  if (!isV2RequestId(row.id) || !sameId(row.id, proof.requestId)) return false;
+  if (!Number.isSafeInteger(proof.blockTimestamp) || !Number.isSafeInteger(proof.expiresAt)) return false;
+  if (proof.blockTimestamp >= proof.expiresAt) return false;
+  const cancelAt = row.cancelledAtSeconds;
+  if (cancelAt == null || !Number.isSafeInteger(cancelAt)) return true;
+  return proof.blockTimestamp >= cancelAt;
 }
 
 /**
  * PAID cannot become CANCELLED. A derived-expired V2 request stays expired
  * instead of becoming CANCELLED. V1 has no expiry in this command.
+ * Phase 14: also records cancelledAtSeconds for payment-before-cancel ordering.
  */
-export function nextCancelledRecord(row: PayRecord, cancelledAt: string, command?: CancelCommand): PayRecord {
+export function nextCancelledRecord(
+  row: PayRecord,
+  cancelledAt: string,
+  command?: CancelCommand,
+  cancelledAtSeconds?: number,
+): PayRecord {
   if (row.paidTx || row.cancelled) return row;
   if (command?.version === 2 && command.nowSeconds >= command.expiresAt) return row;
-  return { ...row, cancelled: true, cancelledAt };
+  const seconds =
+    typeof cancelledAtSeconds === "number" && Number.isSafeInteger(cancelledAtSeconds)
+      ? cancelledAtSeconds
+      : command?.version === 2
+        ? command.nowSeconds
+        : Math.floor(Date.parse(cancelledAt) / 1000);
+  const safeSeconds = Number.isSafeInteger(seconds) && seconds >= 0 ? seconds : Math.floor(Date.now() / 1000);
+  return { ...row, cancelled: true, cancelledAt, cancelledAtSeconds: safeSeconds };
 }
 
 
@@ -600,6 +686,16 @@ export async function createPayRecord(
       store.records[record.token] = saved;
       created = false;
       return;
+    }
+    // Phase 14: (merchant, requestId) uniqueness for new V2 rows. Historical
+    // duplicates are not migrated; a new registration that collides is 409.
+    if (isV2RequestId(record.id)) {
+      for (const other of Object.values(store.records)) {
+        if (!other || other.token === record.token) continue;
+        if (!isV2RequestId(other.id) || !sameId(other.id, record.id)) continue;
+        if (other.to.toLowerCase() !== merchant.toLowerCase()) continue;
+        throw new DuplicateRequestError();
+      }
     }
     const owned = countPayRecordsOwnedBy(Object.values(store.records), merchant);
     if (owned >= limit) {
@@ -662,7 +758,10 @@ export async function markCancelled(token: string, command: CancelCommand): Prom
       result = null;
       return;
     }
-    const next = nextCancelledRecord(row, new Date().toISOString(), command);
+    const cancelledAt = new Date().toISOString();
+    const seconds =
+      command.version === 2 ? command.nowSeconds : Math.floor(Date.parse(cancelledAt) / 1000);
+    const next = nextCancelledRecord(row, cancelledAt, command, seconds);
     if (next === row) {
       result = row;
       return;
@@ -712,6 +811,122 @@ export async function listRecords(): Promise<PayRecord[]> {
  */
 export async function readPayStoreBlob(): Promise<StoreFile> {
   return readStore();
+}
+
+
+function sameTx(left: string, right: string): boolean {
+  return left.toLowerCase() === right.toLowerCase();
+}
+
+/**
+ * Persist a submitted transaction hash as a reconciliation candidate.
+ * Never marks PAID. Caps at MAX_SUBMITTED_HASHES. Duplicate hash is idempotent.
+ */
+export async function addSubmittedHash(token: string, txHash: Hash): Promise<PayRecord | null> {
+  const hash = txHash.toLowerCase() as Hash;
+  if (!/^0x[0-9a-f]{64}$/.test(hash)) return null;
+  let result: PayRecord | null = null;
+  await mutatePayStoreBlob((store) => {
+    const row = store.records[token];
+    if (!row) {
+      result = null;
+      return;
+    }
+    const current = (row.submittedHashes ?? []).map((h) => h.toLowerCase() as Hash);
+    if (current.includes(hash)) {
+      result = row;
+      return;
+    }
+    if (current.length >= MAX_SUBMITTED_HASHES) {
+      result = row;
+      return;
+    }
+    const next: PayRecord = { ...row, submittedHashes: [...current, hash] };
+    store.records[token] = next;
+    result = next;
+  });
+  return result;
+}
+
+export type SettleConflictCode =
+  | "not_found"
+  | "settlement_used"
+  | "duplicate_request"
+  | "already_paid_different"
+  | "rejected"
+  | "late_settlement";
+
+export type SettleApplyResult =
+  | { ok: true; record: PayRecord; transitioned: boolean }
+  | { ok: false; code: SettleConflictCode; record: PayRecord | null };
+
+/**
+ * Pure CAS mutator body for applying a verified settlement proof.
+ * Caller supplies the store snapshot via mutatePayStoreBlob.
+ * Cross-row: one paidTx cannot settle two requests; one requestId cannot be paid twice.
+ */
+export function applySettlementToStore(
+  store: StoreFile,
+  token: string,
+  proof: PaidProof,
+): SettleApplyResult {
+  const row = store.records[token];
+  if (!row) return { ok: false, code: "not_found", record: null };
+
+  // Idempotent: already paid with the same tx.
+  if (row.paidTx && sameTx(row.paidTx, proof.tx)) {
+    return { ok: true, record: row, transitioned: false };
+  }
+  // Immutable paidTx: different hash cannot replace.
+  if (row.paidTx && !sameTx(row.paidTx, proof.tx)) {
+    return { ok: false, code: "already_paid_different", record: row };
+  }
+
+  // Anti-replay: this tx must not already settle another row.
+  for (const other of Object.values(store.records)) {
+    if (!other || other.token === token) continue;
+    if (other.paidTx && sameTx(other.paidTx, proof.tx)) {
+      return { ok: false, code: "settlement_used", record: row };
+    }
+  }
+
+  // One requestId → at most one PAID row (V2).
+  if (proof.version === 2) {
+    for (const other of Object.values(store.records)) {
+      if (!other || other.token === token) continue;
+      if (!isV2RequestId(other.id) || !sameId(other.id, proof.requestId)) continue;
+      if (other.paidTx) {
+        return { ok: false, code: "duplicate_request", record: row };
+      }
+    }
+  }
+
+  const next = nextPaidRecord(row, proof);
+  if (next && next.paidTx && sameTx(next.paidTx, proof.tx) && !row.paidTx) {
+    // Real transition to PAID (including CANCELLED → PAID when payment-before-cancel).
+    store.records[token] = next;
+    return { ok: true, record: next, transitioned: true };
+  }
+
+  if (isLateSettlement(row, proof)) {
+    const late: PayRecord = { ...row, lateSettlementTx: proof.tx };
+    store.records[token] = late;
+    return { ok: false, code: "late_settlement", record: late };
+  }
+
+  return { ok: false, code: "rejected", record: row };
+}
+
+/**
+ * Atomic settlement write. Does not emit webhooks — caller enqueues after a
+ * transitioned:true result (or uses settleAndEnqueue in settlement.ts).
+ */
+export async function settleRecord(token: string, proof: PaidProof): Promise<SettleApplyResult> {
+  let outcome: SettleApplyResult = { ok: false, code: "not_found", record: null };
+  await mutatePayStoreBlob((store) => {
+    outcome = applySettlementToStore(store, token, proof);
+  });
+  return outcome;
 }
 
 /**
