@@ -1,10 +1,9 @@
 "use client";
 
 import { useMerchantData } from "@/components/dashboard/MerchantData";
-import { API_SCOPES, DEFAULT_API_KEY_SCOPES, WALLET_ACTIONS, type ApiScope } from "@/lib/apiScopes";
-import { signedWalletHeaders } from "@/lib/signedWalletHeaders";
+import { API_SCOPES, DEFAULT_API_KEY_SCOPES, type ApiScope } from "@/lib/apiScopes";
+import { useWorkspaceFetch } from "@/components/WorkspaceSession";
 import { useCallback, useEffect, useState } from "react";
-import { useSignMessage } from "wagmi";
 
 type ApiKeyPublic = {
   id: string;
@@ -37,7 +36,7 @@ function when(value: string | null): string {
 
 export function ApiKeysPanel() {
   const { ready, address } = useMerchantData();
-  const { signMessageAsync } = useSignMessage();
+  const workspaceFetch = useWorkspaceFetch();
   const [keys, setKeys] = useState<ApiKeyPublic[]>([]);
   const [name, setName] = useState("");
   const [scopes, setScopes] = useState<ApiScope[]>([...DEFAULT_API_KEY_SCOPES]);
@@ -48,24 +47,12 @@ export function ApiKeysPanel() {
 
   const merchant = address ?? null;
 
-  const authHeaders = useCallback(
-    async (
-      action: (typeof WALLET_ACTIONS)[keyof typeof WALLET_ACTIONS],
-      binding: { method: string; path: string; body?: string },
-    ) => {
-      if (!merchant) throw new Error("Wallet is not connected.");
-      return signedWalletHeaders(action, merchant, (args) => signMessageAsync(args), binding);
-    },
-    [merchant, signMessageAsync],
-  );
-
   const load = useCallback(async () => {
     if (!merchant) return;
     setLoading(true);
     setError(null);
     try {
-      const headers = await authHeaders(WALLET_ACTIONS.apiKeysList, { method: "GET", path: "/api/v1/api-keys" });
-      const res = await fetch("/api/v1/api-keys", { headers });
+      const res = await workspaceFetch("/api/v1/api-keys");
       const body = await res.json();
       if (!res.ok) {
         setError(errorMessage(body));
@@ -79,7 +66,7 @@ export function ApiKeysPanel() {
     } finally {
       setLoading(false);
     }
-  }, [merchant, authHeaders]);
+  }, [merchant, workspaceFetch]);
 
   useEffect(() => {
     void load();
@@ -95,14 +82,9 @@ export function ApiKeysPanel() {
     setError(null);
     try {
       const bodyText = JSON.stringify({ name: name.trim(), scopes });
-      const headers = await authHeaders(WALLET_ACTIONS.apiKeysCreate, {
+      const res = await workspaceFetch("/api/v1/api-keys", {
         method: "POST",
-        path: "/api/v1/api-keys",
-        body: bodyText,
-      });
-      const res = await fetch("/api/v1/api-keys", {
-        method: "POST",
-        headers: { ...headers, "content-type": "application/json" },
+        headers: { "content-type": "application/json" },
         body: bodyText,
       });
       const body = await res.json();
@@ -128,8 +110,7 @@ export function ApiKeysPanel() {
     setError(null);
     try {
       const path = `/api/v1/api-keys/${encodeURIComponent(id)}`;
-      const headers = await authHeaders(WALLET_ACTIONS.apiKeysDelete, { method: "DELETE", path });
-      const res = await fetch(path, { method: "DELETE", headers });
+      const res = await workspaceFetch(path, { method: "DELETE" });
       const body = await res.json();
       if (!res.ok) {
         setError(errorMessage(body));
@@ -148,11 +129,8 @@ export function ApiKeysPanel() {
     setBusy(true);
     setError(null);
     try {
-      const path = `/api/v1/api-keys/${encodeURIComponent(id)}/rotate`;
-      const headers = await authHeaders(WALLET_ACTIONS.apiKeysRotate, { method: "POST", path, body: "" });
-      const res = await fetch(`/api/v1/api-keys/${encodeURIComponent(id)}/rotate`, {
+      const res = await workspaceFetch(`/api/v1/api-keys/${encodeURIComponent(id)}/rotate`, {
         method: "POST",
-        headers,
       });
       const body = await res.json();
       if (!res.ok) {
@@ -193,8 +171,8 @@ export function ApiKeysPanel() {
       <p className="mt-3 text-sm text-[var(--muted)]">
         Programmatic <span className="mono">/api/v1</span> calls use{" "}
         <span className="mono">Authorization: Bearer final_live_…</span>. The full secret is shown once. After that the
-        workspace only shows the prefix and that a secret is configured. Managing keys requires a wallet signature, not
-        another API key.
+        workspace only shows the prefix and that a secret is configured. Managing keys requires the merchant wallet&apos;s
+        workspace sign-in, not another API key.
       </p>
       {error ? <p className="mt-3 text-sm text-[var(--stamp)]">{error}</p> : null}
       {onceSecret ? (

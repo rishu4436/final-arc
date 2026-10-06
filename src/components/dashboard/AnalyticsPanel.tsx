@@ -1,18 +1,15 @@
 "use client";
 
 import { useMerchantData } from "@/components/dashboard/MerchantData";
-import { WALLET_ACTIONS } from "@/lib/apiScopes";
 import { formatUsdc, shortAddr } from "@/lib/format";
-import { signedWalletHeaders } from "@/lib/signedWalletHeaders";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useWorkspaceFetch } from "@/components/WorkspaceSession";
+import { useCallback, useEffect, useState } from "react";
 import { formatUnits } from "viem";
-import { useSignMessage } from "wagmi";
 
 /**
- * Phase 12 analytics console. Reads only GET /api/v1/analytics/* with one
- * wallet-signed analytics.read authorization (reused while inside the server's
- * timestamp tolerance). It never calls the payment-list route, never
- * reconciles, and never writes.
+ * Phase 12 analytics console. Reads only GET /api/v1/analytics/* under the
+ * merchant workspace session (no per-request wallet prompt). It never calls the
+ * payment-list route, never reconciles, and never writes.
  */
 
 type Rate = { numerator: number; denominator: number; rate: number | null };
@@ -110,7 +107,6 @@ const SERIES = [
   { metric: "agent_verified_volume", title: "Agent verified volume", basis: "USDC of VERIFIED machine intents, by verifiedAt (UTC)." },
 ] as const;
 
-const SIGNATURE_REUSE_MS = 240_000;
 const DAY_MS = 86_400_000;
 
 function usdc(baseUnits: string | null | undefined): string {
@@ -240,7 +236,7 @@ function Chart({ title, basis, series }: { title: string; basis: string; series:
 
 export function AnalyticsPanel() {
   const { address } = useMerchantData();
-  const { signMessageAsync } = useSignMessage();
+  const workspaceFetch = useWorkspaceFetch();
   const merchant = address ?? null;
   const [preset, setPreset] = useState<string>("30d");
   const [customFrom, setCustomFrom] = useState(() => dateInput(Date.now() - 30 * DAY_MS));
@@ -250,26 +246,12 @@ export function AnalyticsPanel() {
   const [series, setSeries] = useState<Record<string, Series | null>>({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const auth = useRef<{ merchant: string; at: number; headers: Record<string, string> } | null>(null);
 
   useEffect(() => {
-    auth.current = null;
     setOverview(null);
     setPolicies(null);
     setSeries({});
   }, [merchant]);
-
-  const headers = useCallback(async () => {
-    if (!merchant) throw new Error("Wallet is not connected.");
-    const cached = auth.current;
-    if (cached && cached.merchant === merchant && Date.now() - cached.at < SIGNATURE_REUSE_MS) return cached.headers;
-    const fresh = await signedWalletHeaders(WALLET_ACTIONS.analyticsRead, merchant, (args) => signMessageAsync(args), {
-      method: "GET",
-      path: "/api/v1/analytics",
-    });
-    auth.current = { merchant, at: Date.now(), headers: fresh };
-    return fresh;
-  }, [merchant, signMessageAsync]);
 
   const load = useCallback(async () => {
     if (!merchant) return;
@@ -290,10 +272,9 @@ export function AnalyticsPanel() {
     setLoading(true);
     setError(null);
     try {
-      const h = await headers();
       const range = `from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`;
       const get = async (path: string) => {
-        const res = await fetch(path, { headers: h, cache: "no-store" });
+        const res = await workspaceFetch(path, { cache: "no-store" });
         const body = (await res.json()) as unknown;
         if (!res.ok) throw new Error(errorMessage(body));
         return body as { sections: Record<string, unknown> };
@@ -307,12 +288,11 @@ export function AnalyticsPanel() {
       setPolicies(pol.sections.policies as PolicyDetail);
       setSeries(Object.fromEntries(SERIES.map((s, i) => [s.metric, ts[i].sections.timeseries as Series])));
     } catch (err) {
-      auth.current = null;
       setError(err instanceof Error ? err.message : "Analytics could not be loaded.");
     } finally {
       setLoading(false);
     }
-  }, [merchant, preset, customFrom, customTo, headers]);
+  }, [merchant, preset, customFrom, customTo, workspaceFetch]);
 
   const p = overview?.sections.payments;
   const a = overview?.sections.agents;
@@ -371,7 +351,7 @@ export function AnalyticsPanel() {
         </button>
       </div>
       <p className="mt-2 text-xs text-[var(--muted)]">
-        Loading asks the wallet to sign one analytics.read authorization. It is reused for a few minutes and grants read access only.
+        Read-only. Uses the workspace sign-in session for the connected wallet; loading never asks for another signature.
       </p>
 
       {error ? <p className="mt-6 text-sm text-[var(--stamp)]">{error}</p> : null}

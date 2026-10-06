@@ -1,18 +1,17 @@
 "use client";
 
 import { CancelLinkButton } from "@/components/CancelLinkButton";
-import { WALLET_ACTIONS } from "@/lib/apiScopes";
 import { explorerTx, formatUsdc, shortAddr, shortHash } from "@/lib/format";
 import type { LedgerEntry } from "@/lib/ledger";
 import { registerMissingLinks } from "@/lib/legacyLinkSync";
 import { readLinks } from "@/lib/payLinksLocal";
 import { cancelOffer, decodePayLink, paymentLinkPhase } from "@/lib/payRequest";
 import type { PayRecord } from "@/lib/payStore";
-import { cachedWalletHeaders, forgetWalletHeaders } from "@/lib/walletAuthCache";
+import { useWorkspaceFetch } from "@/components/WorkspaceSession";
 import { useMounted } from "@/hooks/useMounted";
 import Link from "next/link";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { useAccount, useSignMessage } from "wagmi";
+import { useCallback, useEffect, useState } from "react";
+import { useAccount } from "wagmi";
 
 function mergeRows(groups: PayRecord[][]): PayRecord[] {
   const map = new Map<string, PayRecord>();
@@ -60,21 +59,16 @@ export function Statement() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
-  const { signMessageAsync } = useSignMessage();
-  const signRef = useRef(signMessageAsync);
-  signRef.current = signMessageAsync;
+  const workspaceFetch = useWorkspaceFetch();
 
   const refresh = useCallback(async () => {
     if (!address) return;
     setLoading(true);
     try {
-      const sign = (args: { message: string }) => signRef.current(args);
-      // Phase 13 (P1-05): the statement is merchant-private. It requires the existing
-      // wallet authorization for this address ("payments.read").
+      // Phase 13 (P1-05): the statement is merchant-private. It requires the merchant's
+      // wallet authorization ("payments.read"), supplied by the workspace session.
       const load = async () => {
-        const headers = await cachedWalletHeaders(WALLET_ACTIONS.paymentsRead, address, sign, { method: "GET", path: "/api/pay" });
-        const res = await fetch(`/api/statement?address=${address}`, { headers, cache: "no-store" });
-        if (res.status === 401) forgetWalletHeaders(WALLET_ACTIONS.paymentsRead, address);
+        const res = await workspaceFetch(`/api/statement?address=${address}`, { cache: "no-store" });
         const body = (await res.json()) as {
           payments?: LedgerEntry[];
           links?: PayRecord[];
@@ -86,7 +80,7 @@ export function Statement() {
       try {
         loaded = await load();
       } catch {
-        setError("Sign the wallet authorization to load the statement.");
+        setError("Sign in with the wallet to load the statement.");
         return;
       }
       if (!loaded.res.ok) {
@@ -96,7 +90,7 @@ export function Statement() {
       const local = readLinks(address);
       const known = new Set((loaded.body.links ?? []).map((row) => row.token));
       const missing = local.filter((token) => !known.has(token));
-      const registered = await registerMissingLinks(missing, address, sign);
+      const registered = await registerMissingLinks(missing, address, workspaceFetch);
       if (registered > 0) {
         try {
           const again = await load();
@@ -114,6 +108,13 @@ export function Statement() {
     } finally {
       setLoading(false);
     }
+  }, [address, workspaceFetch]);
+
+  // A different wallet never sees the previous wallet's statement.
+  useEffect(() => {
+    setPayments([]);
+    setLinks([]);
+    setError(null);
   }, [address]);
 
   useEffect(() => {

@@ -1,14 +1,12 @@
 "use client";
 
 import { useMerchantData } from "@/components/dashboard/MerchantData";
-import { WALLET_ACTIONS } from "@/lib/apiScopes";
-import { signedWalletHeaders } from "@/lib/signedWalletHeaders";
+import { useWorkspaceFetch } from "@/components/WorkspaceSession";
 import {
   EMITTABLE_WEBHOOK_EVENTS,
   WEBHOOK_EVENT_CATALOG,
   type WebhookEventType,
 } from "@/lib/webhooksCatalog";
-import { useSignMessage } from "wagmi";
 
 type WebhookEndpointPublic = {
   id: string;
@@ -64,7 +62,7 @@ function deliveryStatusLabel(status: string): string {
 
 export function WebhooksPanel() {
   const { ready, address } = useMerchantData();
-  const { signMessageAsync } = useSignMessage();
+  const workspaceFetch = useWorkspaceFetch();
   const [endpoints, setEndpoints] = useState<WebhookEndpointPublic[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -81,24 +79,12 @@ export function WebhooksPanel() {
   const merchant = address ?? null;
   const emittable = useMemo(() => EMITTABLE_WEBHOOK_EVENTS.filter((e) => e !== "webhook.test"), []);
 
-  const authHeaders = useCallback(
-    async (
-      action: (typeof WALLET_ACTIONS)[keyof typeof WALLET_ACTIONS],
-      binding: { method: string; path: string; body?: string },
-    ) => {
-      if (!merchant) throw new Error("Wallet is not connected.");
-      return signedWalletHeaders(action, merchant, (args) => signMessageAsync(args), binding);
-    },
-    [merchant, signMessageAsync],
-  );
-
   const load = useCallback(async () => {
     if (!merchant) return;
     setLoading(true);
     setError(null);
     try {
-      const headers = await authHeaders(WALLET_ACTIONS.webhooksList, { method: "GET", path: "/api/v1/webhooks" });
-      const res = await fetch("/api/v1/webhooks", { headers });
+      const res = await workspaceFetch("/api/v1/webhooks");
       const body = await res.json();
       if (!res.ok) {
         setError(errorMessage(body));
@@ -112,7 +98,7 @@ export function WebhooksPanel() {
     } finally {
       setLoading(false);
     }
-  }, [merchant, authHeaders]);
+  }, [merchant, workspaceFetch]);
 
   useEffect(() => {
     void load();
@@ -123,8 +109,7 @@ export function WebhooksPanel() {
       if (!merchant) return;
       setActiveId(id);
       try {
-        const headers = await authHeaders(WALLET_ACTIONS.webhooksDeliveries, { method: "GET", path: `/api/v1/webhooks/${encodeURIComponent(id)}/deliveries` });
-        const res = await fetch(`/api/v1/webhooks/${encodeURIComponent(id)}/deliveries`, { headers });
+        const res = await workspaceFetch(`/api/v1/webhooks/${encodeURIComponent(id)}/deliveries`);
         const body = await res.json();
         if (!res.ok) {
           setError(errorMessage(body));
@@ -137,7 +122,7 @@ export function WebhooksPanel() {
         setDeliveries([]);
       }
     },
-    [merchant, authHeaders],
+    [merchant, workspaceFetch],
   );
 
   const toggleEvent = (event: WebhookEventType) => {
@@ -150,14 +135,9 @@ export function WebhooksPanel() {
     setError(null);
     try {
       const bodyText = JSON.stringify({ url, events: selected });
-      const headers = await authHeaders(WALLET_ACTIONS.webhooksCreate, {
+      const res = await workspaceFetch("/api/v1/webhooks", {
         method: "POST",
-        path: "/api/v1/webhooks",
-        body: bodyText,
-      });
-      const res = await fetch("/api/v1/webhooks", {
-        method: "POST",
-        headers: { ...headers, "content-type": "application/json" },
+        headers: { "content-type": "application/json" },
         body: bodyText,
       });
       const body = await res.json();
@@ -184,14 +164,9 @@ export function WebhooksPanel() {
     try {
       const path = `/api/v1/webhooks/${encodeURIComponent(id)}`;
       const bodyText = JSON.stringify(patchBody);
-      const headers = await authHeaders(WALLET_ACTIONS.webhooksUpdate, {
+      const res = await workspaceFetch(path, {
         method: "PATCH",
-        path,
-        body: bodyText,
-      });
-      const res = await fetch(path, {
-        method: "PATCH",
-        headers: { ...headers, "content-type": "application/json" },
+        headers: { "content-type": "application/json" },
         body: bodyText,
       });
       const body = await res.json();
@@ -217,10 +192,8 @@ export function WebhooksPanel() {
     setBusy(true);
     setError(null);
     try {
-      const headers = await authHeaders(WALLET_ACTIONS.webhooksDelete, { method: "DELETE", path: `/api/v1/webhooks/${encodeURIComponent(id)}` });
-      const res = await fetch(`/api/v1/webhooks/${encodeURIComponent(id)}`, {
+      const res = await workspaceFetch(`/api/v1/webhooks/${encodeURIComponent(id)}`, {
         method: "DELETE",
-        headers,
       });
       const body = await res.json();
       if (!res.ok) {
@@ -244,10 +217,8 @@ export function WebhooksPanel() {
     setBusy(true);
     setError(null);
     try {
-      const headers = await authHeaders(WALLET_ACTIONS.webhooksTest, { method: "POST", path: `/api/v1/webhooks/${encodeURIComponent(id)}/test`, body: "" });
-      const res = await fetch(`/api/v1/webhooks/${encodeURIComponent(id)}/test`, {
+      const res = await workspaceFetch(`/api/v1/webhooks/${encodeURIComponent(id)}/test`, {
         method: "POST",
-        headers,
       });
       const body = await res.json();
       if (!res.ok) {
@@ -275,7 +246,7 @@ export function WebhooksPanel() {
       <section className="mt-12 border-t border-[var(--line)] pt-8">
         <h2 className="display text-2xl">Webhooks</h2>
         <p className="mt-3 text-sm text-[var(--muted)]">
-          Connect the merchant wallet. Dashboard changes are signed by that wallet. Programmatic webhook calls use a
+          Connect the merchant wallet. Dashboard changes require that wallet&apos;s workspace sign-in. Programmatic webhook calls use a
           FINAL API key instead. A merchant address by itself is not authorization.
         </p>
       </section>
@@ -286,7 +257,7 @@ export function WebhooksPanel() {
     <section className="mt-12 border-t border-[var(--line)] pt-8">
       <h2 className="display text-2xl">Webhooks</h2>
       <p className="mt-3 text-sm text-[var(--muted)]">
-        Endpoints for this connected wallet. Each change asks the wallet to sign a short-lived authorization. Failed
+        Endpoints for this connected wallet, managed under its workspace sign-in session. Failed
         deliveries are recorded. Automatic background retries are coming soon. Deduplicate webhook events by{" "}
         <span className="mono">eventId</span>. Secrets are shown only once on create or rotate.
       </p>

@@ -1,17 +1,16 @@
 "use client";
 
 import { CancelLinkButton } from "@/components/CancelLinkButton";
-import { WALLET_ACTIONS } from "@/lib/apiScopes";
 import { explorerTx, formatUsdc, shortHash } from "@/lib/format";
 import { registerMissingLinks } from "@/lib/legacyLinkSync";
 import { readLinks } from "@/lib/payLinksLocal";
 import { cancelOffer, decodePayLink, paymentLinkPhase } from "@/lib/payRequest";
 import type { PayRecord } from "@/lib/payStore";
-import { cachedWalletHeaders, forgetWalletHeaders } from "@/lib/walletAuthCache";
+import { useWorkspaceFetch } from "@/components/WorkspaceSession";
 import { useMounted } from "@/hooks/useMounted";
 import Link from "next/link";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { useAccount, useSignMessage } from "wagmi";
+import { useCallback, useEffect, useState } from "react";
+import { useAccount } from "wagmi";
 
 function mergeRows(groups: PayRecord[][]): PayRecord[] {
   const map = new Map<string, PayRecord>();
@@ -45,18 +44,14 @@ export function HistoryList() {
   const [rows, setRows] = useState<PayRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
-  const { signMessageAsync } = useSignMessage();
-  const signRef = useRef(signMessageAsync);
-  signRef.current = signMessageAsync;
+  const workspaceFetch = useWorkspaceFetch();
 
   const refresh = useCallback(async () => {
     if (!address) return;
-    const sign = (args: { message: string }) => signRef.current(args);
-    // Phase 13 (P1-05): the payee list requires the existing wallet authorization ("payments.read").
+    // Phase 13 (P1-05): the payee list requires the merchant's wallet authorization ("payments.read"),
+    // supplied by the workspace session (one sign-in signature, not one per request).
     const load = async () => {
-      const headers = await cachedWalletHeaders(WALLET_ACTIONS.paymentsRead, address, sign, { method: "GET", path: "/api/pay" });
-      const res = await fetch(`/api/pay?to=${address}`, { headers, cache: "no-store" });
-      if (res.status === 401) forgetWalletHeaders(WALLET_ACTIONS.paymentsRead, address);
+      const res = await workspaceFetch(`/api/pay?to=${address}`, { cache: "no-store" });
       const body = (await res.json()) as { records?: PayRecord[]; error?: string };
       return { res, body };
     };
@@ -64,7 +59,7 @@ export function HistoryList() {
     try {
       loaded = await load();
     } catch {
-      setError("Sign the wallet authorization to load history.");
+      setError("Sign in with the wallet to load history.");
       return;
     }
     if (!loaded.res.ok) {
@@ -73,7 +68,7 @@ export function HistoryList() {
     }
     const local = readLinks(address);
     const known = new Set((loaded.body.records ?? []).map((row) => row.token));
-    if ((await registerMissingLinks(local.filter((token) => !known.has(token)), address, sign)) > 0) {
+    if ((await registerMissingLinks(local.filter((token) => !known.has(token)), address, workspaceFetch)) > 0) {
       try {
         const again = await load();
         if (again.res.ok) loaded = again;
@@ -96,6 +91,12 @@ export function HistoryList() {
     setError(null);
     setRows(mergeRows([body.records ?? [], remembered]));
     setNowSeconds(Math.floor(Date.now() / 1000));
+  }, [address, workspaceFetch]);
+
+  // A different wallet never sees the previous wallet's rows.
+  useEffect(() => {
+    setRows([]);
+    setError(null);
   }, [address]);
 
   useEffect(() => {

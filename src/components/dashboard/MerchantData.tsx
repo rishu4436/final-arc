@@ -8,12 +8,12 @@ import {
   presentWorkspaceError,
   type DashboardModel,
 } from "@/lib/merchantDashboard";
-import { WALLET_ACTIONS } from "@/lib/apiScopes";
-import { cachedWalletHeaders, forgetWalletHeaders } from "@/lib/walletAuthCache";
+import { useWorkspaceFetch } from "@/components/WorkspaceSession";
+import { WorkspaceAuthError } from "@/lib/workspaceSessionClient";
 import { isAddress, type Address } from "viem";
-import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 import { usePathname } from "next/navigation";
-import { useAccount, useSignMessage } from "wagmi";
+import { useAccount } from "wagmi";
 
 export type MerchantDataValue = {
   mounted: boolean;
@@ -48,12 +48,9 @@ export function MerchantDataProvider({ children }: { children: ReactNode }) {
   const [error, setError] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
   const refresh = useCallback(() => setTick((value) => value + 1), []);
-  // Phase 13 (P1-05): GET /api/pay?to= requires the merchant's wallet authorization
-  // (existing signed-header scheme, action "payments.read"). Ref so the effect does not
-  // re-run when wagmi hands back a new function identity.
-  const { signMessageAsync } = useSignMessage();
-  const signRef = useRef(signMessageAsync);
-  signRef.current = signMessageAsync;
+  // Phase 13 (P1-05): GET /api/pay?to= requires the merchant's wallet authorization.
+  // The workspace session (one sign-in signature) supplies it; no per-request prompt.
+  const workspaceFetch = useWorkspaceFetch();
 
   useEffect(() => {
     setModel(emptyDashboard(true));
@@ -67,24 +64,19 @@ export function MerchantDataProvider({ children }: { children: ReactNode }) {
     setLoading(true);
     void (async () => {
       try {
-        let headers: Record<string, string>;
+        let res: Response;
         try {
-          headers = await cachedWalletHeaders(WALLET_ACTIONS.paymentsRead, requested, (args) => signRef.current(args), {
-            method: "GET",
-            path: "/api/pay",
-          });
-        } catch {
+          res = await workspaceFetch(`/api/pay?to=${requested}`);
+        } catch (err) {
           if (!cancelled) {
-            setError("Sign the wallet authorization to load payment requests.");
+            setError(err instanceof WorkspaceAuthError ? err.message : "Payment requests could not be loaded.");
             setModel(emptyDashboard(false));
           }
           return;
         }
         if (cancelled) return;
-        const res = await fetch(`/api/pay?to=${requested}`, { headers, cache: "no-store" });
         const body = (await res.json()) as { records?: unknown; error?: string };
         if (cancelled) return;
-        if (res.status === 401) forgetWalletHeaders(WALLET_ACTIONS.paymentsRead, requested);
         if (!res.ok) {
           setError(
             presentWorkspaceError(typeof body.error === "string" ? body.error : null) ??
@@ -113,7 +105,7 @@ export function MerchantDataProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [merchant, tick, skipPaymentList]);
+  }, [merchant, tick, skipPaymentList, workspaceFetch]);
 
   const value: MerchantDataValue = {
     mounted,

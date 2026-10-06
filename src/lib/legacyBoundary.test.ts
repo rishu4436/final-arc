@@ -979,12 +979,12 @@ test("analytics and checkout isolation are unchanged; dashboard callers send wal
   const merchantData = src("src/components/dashboard/MerchantData.tsx");
   assert.match(merchantData, /pathname === "\/dashboard\/analytics"/);
   assert.match(merchantData, /if \(!merchant \|\| skipPaymentList\) return;/);
-  assert.match(merchantData, /WALLET_ACTIONS\.paymentsRead/);
+  // Merchant-private reads go through the workspace session (wallet-authorized, one sign-in).
+  assert.match(merchantData, /workspaceFetch\(`\/api\/pay\?to=/);
   const analyticsPanel = src("src/components/dashboard/AnalyticsPanel.tsx");
   assert.doesNotMatch(analyticsPanel, /\/api\/pay|\/api\/statement/);
-  for (const file of ["src/components/Statement.tsx", "src/components/HistoryList.tsx"]) {
-    assert.match(src(file), /WALLET_ACTIONS\.paymentsRead/, file);
-  }
+  assert.match(src("src/components/Statement.tsx"), /workspaceFetch\(`\/api\/statement\?address=/);
+  assert.match(src("src/components/HistoryList.tsx"), /workspaceFetch\(`\/api\/pay\?to=/);
   assert.doesNotMatch(src("src/components/RequestForm.tsx"), /webhookUrl/);
   const checkout = src("src/components/Checkout.tsx");
   assert.match(checkout, /\/api\/pay\/observe\?token=/);

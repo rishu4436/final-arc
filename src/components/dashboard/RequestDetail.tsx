@@ -11,12 +11,10 @@ import {
   shareTargets,
   type PublicReceiptFacts,
 } from "@/lib/merchantDashboard";
-import { WALLET_ACTIONS } from "@/lib/apiScopes";
 import { cancelOffer } from "@/lib/payRequest";
-import { cachedWalletHeaders } from "@/lib/walletAuthCache";
+import { useWorkspaceFetch } from "@/components/WorkspaceSession";
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { useSignMessage } from "wagmi";
 
 function Field({ label, value }: { label: string; value: string | null }) {
   if (!value) return null;
@@ -34,7 +32,7 @@ function yesNo(value: boolean): string {
 
 export function RequestDetail({ token }: { token: string }) {
   const { model, loading, error, refresh, address } = useMerchantData();
-  const { signMessageAsync } = useSignMessage();
+  const workspaceFetch = useWorkspaceFetch();
   const lookup = lookupWorkspaceRequest(model, token);
   const row = lookup.state === "found" ? lookup.row : null;
   const [facts, setFacts] = useState<PublicReceiptFacts | null>(null);
@@ -119,15 +117,9 @@ export function RequestDetail({ token }: { token: string }) {
     setReconcileError(null);
     const bodyText = JSON.stringify({ action: "reconcile", token: row.token });
     try {
-      const headers = await cachedWalletHeaders(
-        WALLET_ACTIONS.paymentsRegister,
-        address,
-        (args) => signMessageAsync(args),
-        { method: "POST", path: "/api/pay", body: bodyText },
-      );
-      const res = await fetch("/api/pay", {
+      const res = await workspaceFetch("/api/pay", {
         method: "POST",
-        headers: { "content-type": "application/json", ...headers },
+        headers: { "content-type": "application/json" },
         body: bodyText,
       });
       const body = (await res.json().catch(() => ({}))) as { error?: string };

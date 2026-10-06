@@ -1,11 +1,9 @@
 "use client";
 
 import { useMerchantData } from "@/components/dashboard/MerchantData";
-import { WALLET_ACTIONS } from "@/lib/apiScopes";
 import { ARC_CHAIN_ID, USDC_ADDRESS } from "@/lib/arc";
-import { signedWalletHeaders } from "@/lib/signedWalletHeaders";
+import { useWorkspaceFetch } from "@/components/WorkspaceSession";
 import { useCallback, useEffect, useState } from "react";
-import { useSignMessage } from "wagmi";
 
 type Rules = {
   maxAmountBaseUnits?: string;
@@ -45,7 +43,7 @@ function lines(value: string): string[] {
 
 export function PoliciesPanel() {
   const { address } = useMerchantData();
-  const { signMessageAsync } = useSignMessage();
+  const workspaceFetch = useWorkspaceFetch();
   const [policies, setPolicies] = useState<Policy[]>([]);
   const [name, setName] = useState("");
   const [maxAmount, setMaxAmount] = useState("");
@@ -59,23 +57,11 @@ export function PoliciesPanel() {
   const [busy, setBusy] = useState(false);
   const merchant = address ?? null;
 
-  const authHeaders = useCallback(
-    async (
-      action: (typeof WALLET_ACTIONS)[keyof typeof WALLET_ACTIONS],
-      binding: { method: string; path: string; body?: string },
-    ) => {
-      if (!merchant) throw new Error("Wallet is not connected.");
-      return signedWalletHeaders(action, merchant, (args) => signMessageAsync(args), binding);
-    },
-    [merchant, signMessageAsync],
-  );
-
   const load = useCallback(async () => {
     if (!merchant) return;
     setError(null);
     try {
-      const headers = await authHeaders(WALLET_ACTIONS.policiesList, { method: "GET", path: "/api/v1/policies" });
-      const res = await fetch("/api/v1/policies", { headers });
+      const res = await workspaceFetch("/api/v1/policies");
       const body = await res.json();
       if (!res.ok) {
         setError(errorMessage(body));
@@ -87,7 +73,7 @@ export function PoliciesPanel() {
       setError("Could not load policies.");
       setPolicies([]);
     }
-  }, [merchant, authHeaders]);
+  }, [merchant, workspaceFetch]);
 
   useEffect(() => {
     void load();
@@ -117,14 +103,9 @@ export function PoliciesPanel() {
     setError(null);
     try {
       const bodyText = JSON.stringify({ name: name.trim(), rules });
-      const headers = await authHeaders(WALLET_ACTIONS.policiesCreate, {
+      const res = await workspaceFetch("/api/v1/policies", {
         method: "POST",
-        path: "/api/v1/policies",
-        body: bodyText,
-      });
-      const res = await fetch("/api/v1/policies", {
-        method: "POST",
-        headers: { ...headers, "content-type": "application/json" },
+        headers: { "content-type": "application/json" },
         body: bodyText,
       });
       const body = await res.json();
@@ -155,14 +136,9 @@ export function PoliciesPanel() {
     try {
       const path = `/api/v1/policies/${encodeURIComponent(policy.id)}`;
       const bodyText = JSON.stringify(input);
-      const headers = await authHeaders(WALLET_ACTIONS.policiesUpdate, {
+      const res = await workspaceFetch(path, {
         method: "PATCH",
-        path,
-        body: bodyText,
-      });
-      const res = await fetch(path, {
-        method: "PATCH",
-        headers: { ...headers, "content-type": "application/json" },
+        headers: { "content-type": "application/json" },
         body: bodyText,
       });
       const body = await res.json();
@@ -185,10 +161,8 @@ export function PoliciesPanel() {
     setError(null);
     try {
       const path = `/api/v1/policies/${encodeURIComponent(policy.id)}`;
-      const headers = await authHeaders(WALLET_ACTIONS.policiesDelete, { method: "DELETE", path });
-      const res = await fetch(path, {
+      const res = await workspaceFetch(path, {
         method: "DELETE",
-        headers,
       });
       const body = await res.json();
       if (!res.ok) {

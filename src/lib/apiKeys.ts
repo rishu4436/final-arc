@@ -19,6 +19,7 @@ import {
   ResourceLimitExceededError,
 } from "./resourceLimits";
 import { consumeWalletNonce, isWalletNonce, preAuthBucketKey, walletPayloadDigest } from "./walletNonce";
+import { authenticateWorkspaceSession, liveWorkspaceSessionRuntime, type WorkspaceSessionRuntime } from "./workspaceSession";
 
 /**
  * API keys authorize /api/v1. The secret is returned once. The store keeps
@@ -93,6 +94,12 @@ export type ApiKeyRuntime = {
   distributedRateLimit?: DistributedRateLimiter | null;
   /** P2-01: override nonce consumption (tests). Defaults to shared-store CAS. */
   consumeWalletNonce?: (merchant: Address, nonce: string, nowSeconds: number) => Promise<boolean>;
+  /**
+   * Merchant workspace session (single-signature dashboard auth). Defaults to the live
+   * cookie session store. Only consulted for wallet-authorized routes when the request
+   * carries no wallet-signature headers and no Bearer key.
+   */
+  workspaceSession?: WorkspaceSessionRuntime;
 };
 
 type AuthFailure = { ok: false; status: number; code: string; message: string };
@@ -378,6 +385,29 @@ export async function recoverWalletMerchant(
   return { ok: true, merchant };
 }
 
+function hasWalletSignatureHeaders(request: Request): boolean {
+  return Object.values(WALLET_AUTH_HEADERS).some((name) => request.headers.get(name) !== null);
+}
+
+/**
+ * Wallet-authorized merchant for dashboard routes. Per-request signed headers keep
+ * working unchanged. Without them, a valid workspace session cookie (established by
+ * one sign-in signature) authorizes the same wallet actions for its own merchant.
+ * A session never authorizes Bearer-only (API key / agent) routes.
+ */
+async function walletOrSessionMerchant(
+  request: Request,
+  action: WalletAction,
+  runtime: ApiKeyRuntime,
+  binding: WalletAuthBindingOpts,
+): Promise<{ ok: true; merchant: Address } | AuthFailure> {
+  if (!hasWalletSignatureHeaders(request)) {
+    const session = await authenticateWorkspaceSession(request, runtime.workspaceSession ?? liveWorkspaceSessionRuntime());
+    if (session) return session;
+  }
+  return recoverWalletMerchant(request, action, runtime.nowSeconds(), binding);
+}
+
 export async function authorizeHttp(
   request: Request,
   opts: {
@@ -397,7 +427,7 @@ export async function authorizeHttp(
     return { ok: true, merchant: auth.merchant };
   }
   if (opts.walletAction) {
-    const wallet = await recoverWalletMerchant(request, opts.walletAction, runtime.nowSeconds(), {
+    const wallet = await walletOrSessionMerchant(request, opts.walletAction, runtime, {
       bodyText: opts.bodyText,
       resourcePath: opts.resourcePath,
       consumeNonce: runtime.consumeWalletNonce,
@@ -516,7 +546,7 @@ async function walletMerchant(
   runtime: ApiKeyRuntime,
   binding: WalletAuthBindingOpts = {},
 ): Promise<{ ok: true; merchant: Address } | { ok: false; error: ApiErrorResult }> {
-  const wallet = await recoverWalletMerchant(request, action, runtime.nowSeconds(), {
+  const wallet = await walletOrSessionMerchant(request, action, runtime, {
     ...binding,
     consumeNonce: binding.consumeNonce ?? runtime.consumeWalletNonce,
   });

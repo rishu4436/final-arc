@@ -7,11 +7,11 @@ import { WALLET_ACTIONS, type WalletAction } from "@/lib/apiScopes";
 import { shortAddr } from "@/lib/format";
 import { escrowActionTypedData } from "@/lib/escrowTerms";
 import { escrowFreshness, submittedHashNote } from "@/lib/escrowFreshness";
-import { signedWalletHeaders } from "@/lib/signedWalletHeaders";
+import { useWorkspaceFetch } from "@/components/WorkspaceSession";
 import Link from "next/link";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { getAddress, isAddress, type Address, type Hex } from "viem";
-import { useAccount, usePublicClient, useSignMessage, useSignTypedData, useSwitchChain, useWalletClient } from "wagmi";
+import { useAccount, usePublicClient, useSignTypedData, useSwitchChain, useWalletClient } from "wagmi";
 
 type EscrowJson = {
   escrowId: string;
@@ -76,23 +76,25 @@ function explorerTx(hash: string): string {
 export function EscrowList() {
   const mounted = useMounted();
   const { address, isConnected } = useAccount();
-  const { signMessageAsync } = useSignMessage();
+  const workspaceFetch = useWorkspaceFetch();
   const [rows, setRows] = useState<EscrowJson[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [loadedAt, setLoadedAt] = useState<number | null>(null);
   const ready = mounted && isConnected && typeof address === "string" && isAddress(address);
 
+  // A different wallet never sees the previous wallet's rows.
+  useEffect(() => {
+    setRows(null);
+    setLoadedAt(null);
+  }, [address]);
+
   async function load() {
     if (!ready) return;
     setBusy(true);
     setError(null);
     try {
-      const headers = await signedWalletHeaders(WALLET_ACTIONS.escrowsList, address as Address, signMessageAsync, {
-        method: "GET",
-        path: "/api/v1/escrows",
-      });
-      const res = await fetch("/api/v1/escrows", { headers });
+      const res = await workspaceFetch("/api/v1/escrows");
       const body = (await res.json()) as { escrows?: EscrowJson[] };
       if (!res.ok) {
         setError(errorText(body));
@@ -160,7 +162,7 @@ export function EscrowList() {
 export function EscrowDetail({ escrowId }: { escrowId: string }) {
   const mounted = useMounted();
   const { address, isConnected, chainId } = useAccount();
-  const { signMessageAsync } = useSignMessage();
+  const workspaceFetch = useWorkspaceFetch();
   const { signTypedDataAsync } = useSignTypedData();
   const { switchChainAsync } = useSwitchChain();
   const { data: walletClient } = useWalletClient();
@@ -177,16 +179,19 @@ export function EscrowDetail({ escrowId }: { escrowId: string }) {
   const ready = mounted && isConnected && typeof address === "string" && isAddress(address);
   const wallet = ready ? getAddress(address) : null;
 
+  // A different wallet never sees the previous wallet's escrow view or drafts.
+  useEffect(() => {
+    setRow(null);
+    setDraft(null);
+    setLoadedAt(null);
+  }, [address]);
+
   async function load() {
     if (!wallet) return;
     setBusy(true);
     setError(null);
     try {
-      const headers = await signedWalletHeaders(WALLET_ACTIONS.escrowsGet, wallet, signMessageAsync, {
-        method: "GET",
-        path: `/api/v1/escrows/${escrowId}`,
-      });
-      const res = await fetch(`/api/v1/escrows/${escrowId}`, { headers });
+      const res = await workspaceFetch(`/api/v1/escrows/${escrowId}`);
       const body = (await res.json()) as { escrow?: EscrowJson };
       if (!res.ok || !body.escrow) {
         setError(errorText(body));
@@ -204,17 +209,15 @@ export function EscrowDetail({ escrowId }: { escrowId: string }) {
     }
   }
 
+  // Server-side escrow reads, prepares, and confirmations use the workspace session.
+  // On-chain steps (sendPrepared, cancel EIP-712) still require the wallet below.
   async function post(path: string, action: WalletAction, payload: Record<string, unknown>) {
     if (!wallet) throw new Error("Wallet is not connected.");
+    void action;
     const bodyText = JSON.stringify(payload);
-    const headers = await signedWalletHeaders(action, wallet, signMessageAsync, {
+    const res = await workspaceFetch(path, {
       method: "POST",
-      path,
-      body: bodyText,
-    });
-    const res = await fetch(path, {
-      method: "POST",
-      headers: { ...headers, "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: bodyText,
     });
     const body = (await res.json()) as { escrow?: EscrowJson; error?: { message?: string } };

@@ -146,7 +146,7 @@ FINAL_API_KEY_PEPPER=<random secret, ≥32 bytes, Vercel Secret>
 ```
 
 - Stored keys are `HMAC-SHA256(FINAL_API_KEY_PEPPER, secret)`. No unsalted fallback; the app never generates a pepper.
-- Missing pepper → API-key auth/create/rotate fail closed (`503`). Wallet-signed dashboard requests are unaffected.
+- Missing pepper → API-key auth/create/rotate fail closed (`503`). Per-request wallet-signed dashboard requests are unaffected; workspace sign-in derives its challenge key from the pepper unless `FINAL_SESSION_SECRET` (≥32 chars) is set, and fails closed without either.
 - **Changing the pepper invalidates every existing API key.**
 
 Never commit the pepper. Never put it in `.env` files in the repository. Never send it to the browser.
@@ -155,7 +155,11 @@ Never commit the pepper. Never put it in `.env` files in the repository. Never s
 
 ## Wallet authorization
 
-Dashboard wallet signatures bind `action`, `merchant`, `timestamp`, a one-time `nonce`, and a SHA-256 digest of `METHOD\npathname\nrawBody`. Nonces are consumed atomically after recovery. Concurrent reuse fails closed.
+**Merchant workspace session (dashboard).** Connecting a wallet asks for **one** Sign-In with Ethereum (EIP-4361) signature over a server-generated challenge bound to the FINAL host/origin, the wallet, a single-use nonce, issued-at, a 5-minute expiry, and a sign-in-only statement. The server verifies it, consumes the nonce once, and issues a random session id in a `__Host-` cookie (`Secure; HttpOnly; SameSite=Strict`, 8-hour absolute lifetime; only its SHA-256 is stored). Dashboard reads and writes (overview, analytics, webhooks, API keys, policies, escrow API calls) then reuse that session with no further prompts. Every session request must name the connected wallet in `x-final-session-merchant`; a different wallet, an expired/forged/logged-out session, or a cross-origin request is rejected. Sign out, wallet disconnect, or an account switch revokes the session server-side. The wallet signature is never stored or reused as a credential.
+
+The session is not signing authority: transactions (USDC transfers, escrow open/fund/cancel, Memo payments) and protocol signatures (V2 EIP-712 payment requests and cancellations, escrow EIP-712 actions) still require the external wallet each time. FINAL never signs or broadcasts.
+
+**Per-request signed headers** (still accepted, e.g. for scripts) bind `action`, `merchant`, `timestamp`, a one-time `nonce`, and a SHA-256 digest of `METHOD\npathname\nrawBody`. Nonces are consumed atomically after recovery. Concurrent reuse fails closed. API keys (`Authorization: Bearer`) are unchanged and remain the only credential for machine/agent routes; a workspace session never authorizes them.
 
 ---
 

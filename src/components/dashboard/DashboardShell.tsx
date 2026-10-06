@@ -1,12 +1,13 @@
 "use client";
 
 import { ConnectButton } from "@/components/ConnectButton";
+import { useWorkspaceSession } from "@/components/WorkspaceSession";
 import { MerchantDataProvider, useMerchantData } from "@/components/dashboard/MerchantData";
 import { ARC_CHAIN_ID } from "@/lib/arc";
 import { shortAddr } from "@/lib/format";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 
 const NAV = [
   { href: "/dashboard", label: "Overview", exact: true },
@@ -42,10 +43,55 @@ function NavLinks({ pathname }: { pathname: string }) {
   );
 }
 
+/**
+ * Workspace sign-in state. One wallet signature opens a session for this wallet;
+ * the dashboard never asks again until it expires, the wallet changes, or the user
+ * signs out. Transactions still need their own wallet confirmation.
+ */
+function SessionControl({ onSessionChange }: { onSessionChange: () => void }) {
+  const { status, signIn, signOut } = useWorkspaceSession();
+  const [error, setError] = useState<string | null>(null);
+  if (status === "signing") {
+    return <p className="text-sm text-[var(--muted)]">Confirm the FINAL sign-in in your wallet…</p>;
+  }
+  if (status === "declined" || status === "signed_out") {
+    return (
+      <p className="text-sm">
+        <button
+          type="button"
+          className="underline"
+          onClick={() => {
+            setError(null);
+            signIn().then(onSessionChange, (err: unknown) => setError(err instanceof Error ? err.message : "Sign-in failed."));
+          }}
+        >
+          Sign in to workspace
+        </button>
+        {error ? <span className="ml-2 text-[var(--stamp)]">{error}</span> : null}
+      </p>
+    );
+  }
+  if (status === "authenticated") {
+    return (
+      <button type="button" className="text-sm text-[var(--muted)] underline" onClick={() => void signOut().then(onSessionChange)}>
+        Sign out
+      </button>
+    );
+  }
+  return null;
+}
+
 function ShellFrame({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const data = useMerchantData();
   const { mounted, ready, address, network } = data;
+  // Remount panels after an explicit sign-in or sign-out (reload under the new state) and
+  // on a wallet switch (no panel keeps the previous wallet's data on screen).
+  const [sessionGeneration, setSessionGeneration] = useState(0);
+  const onSessionChange = () => {
+    setSessionGeneration((value) => value + 1);
+    data.refresh();
+  };
   const apiDocs = pathname === "/dashboard/api" || pathname.startsWith("/dashboard/api/");
   const showWorkspace = ready || apiDocs;
 
@@ -73,6 +119,7 @@ function ShellFrame({ children }: { children: ReactNode }) {
                 <span className="text-[var(--muted)]">Chain ID </span>
                 <span className="mono">{network.chainId ?? "—"}</span>
               </p>
+              <SessionControl onSessionChange={onSessionChange} />
               <ConnectButton />
             </div>
           ) : mounted && apiDocs ? (
@@ -116,7 +163,9 @@ function ShellFrame({ children }: { children: ReactNode }) {
                 connected chain.
               </p>
             ) : null}
-            <div className="px-5 py-8">{children}</div>
+            <div key={`${address ?? "none"}:${sessionGeneration}`} className="px-5 py-8">
+              {children}
+            </div>
           </div>
         </div>
       ) : null}
