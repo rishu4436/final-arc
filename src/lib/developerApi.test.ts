@@ -5,6 +5,8 @@ import {
   encodeEventTopics,
   encodeFunctionData,
   erc20Abi,
+  getAddress,
+  isAddress,
   keccak256,
   stringToHex,
   type Address,
@@ -849,4 +851,43 @@ test("a store failure does not leak a stack", async () => {
   assert.equal(error.error.code, API_ERROR_CODES.storeUnavailable);
   assert.equal(error.error.message.includes("password"), false);
   assert.equal(error.error.message.includes("writeKv"), false);
+});
+
+test("merchant ownership comparison is representation-safe for the same address", async () => {
+  const store = memory();
+  const body = await signedBody();
+  const upper = "0x" + merchant.address.slice(2).toUpperCase();
+  assert.equal(isAddress(upper, { strict: true }), false);
+  assert.equal(getAddress(upper), merchant.address);
+  const result = await createPaymentRequest(post({ ...body, merchant: upper, recipient: upper }), store.deps);
+  assert.equal(result.status, 200);
+  assert.equal(isResource(result.body).merchant, merchant.address);
+  assert.equal(store.rows.length, 1);
+});
+
+test("uppercase form of a different merchant still fails ownership comparison", async () => {
+  const store = memory();
+  const fields = validateFinalRequest(
+    draft({ merchant: other.address, recipient: other.address, memo: "other-upper" }),
+  );
+  const signed = await signFinalRequest(fields, other);
+  const upperOther = "0x" + other.address.slice(2).toUpperCase();
+  assert.equal(isAddress(upperOther, { strict: true }), false);
+  const denied = await createPaymentRequest(
+    post({
+      requestId: signed.requestId,
+      merchant: upperOther,
+      recipient: upperOther,
+      amountBaseUnits: signed.amountBaseUnits.toString(),
+      memo: signed.memo,
+      chainId: signed.chainId,
+      expiresAt: signed.expiresAt,
+      nonce: signed.nonce,
+      signature: signed.signature,
+    }),
+    store.deps,
+  );
+  assert.equal(denied.status, 403);
+  assert.equal(errorBody(denied.body).error.code, API_ERROR_CODES.forbidden);
+  assert.equal(store.rows.length, 0);
 });

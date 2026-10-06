@@ -514,7 +514,8 @@ export async function createPaymentRequest(
         deps,
       ));
     const body = await readObject(request);
-    if (typeof body.merchant === "string" && isAddress(body.merchant) && getAddress(body.merchant) !== caller) {
+    // Same non-strict admission as V2: casing must not skip the ownership comparison.
+    if (typeof body.merchant === "string" && isAddress(body.merchant, { strict: false }) && getAddress(body.merchant) !== caller) {
       fail(403, API_ERROR_CODES.forbidden, "Merchant does not match the API key.");
     }
     const draft = parseDraft(body);

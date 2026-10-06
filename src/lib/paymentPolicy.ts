@@ -126,9 +126,18 @@ function reason(code: PolicyDenialCode, message: string, policyId?: string): Pol
   return policyId ? { code, message, policyId } : { code, message };
 }
 
-function checksum(value: string): string | null {
-  if (!isAddress(value)) return null;
+/**
+ * Same admission rule as V2 parseAddress: accept any valid 20-byte hex form
+ * (including lowercase / uppercase / wrong-checksum), then EIP-55 canonicalize.
+ * Security decisions must never treat two spellings of the same address as different.
+ */
+export function canonicalizeAddress(value: string): string | null {
+  if (typeof value !== "string" || !isAddress(value, { strict: false })) return null;
   return getAddress(value);
+}
+
+function checksum(value: string): string | null {
+  return canonicalizeAddress(value);
 }
 
 function spendInWindow(spend: readonly VerifiedSpend[], now: number, windowSeconds: number): bigint {

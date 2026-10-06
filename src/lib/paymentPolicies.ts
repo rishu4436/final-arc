@@ -1,10 +1,11 @@
 import { randomBytes } from "node:crypto";
-import { getAddress, isAddress, type Address } from "viem";
+import { type Address } from "viem";
 import { authorizeHttp, AUTH_MESSAGE, type ApiKeyRuntime, liveApiKeyRuntime } from "./apiKeys";
 import { WALLET_ACTIONS, type ApiScope, type WalletAction } from "./apiScopes";
 import { USDC_ADDRESS } from "./arc";
 import { mutatePayStoreBlob, readPayStoreBlob, type PolicyStoreSection, type StoreFile } from "./payStore";
 import {
+  canonicalizeAddress,
   evaluatePaymentPolicy,
   mergePolicyRules,
   parsePolicyRules,
@@ -114,7 +115,9 @@ export function ensurePolicySection(store: StoreFile): PolicyStoreSection {
 }
 
 function sameMerchant(left: string, right: string): boolean {
-  return isAddress(left) && isAddress(right) && getAddress(left) === getAddress(right);
+  const a = canonicalizeAddress(left);
+  const b = canonicalizeAddress(right);
+  return a != null && b != null && a === b;
 }
 
 export function policiesForMerchant(store: StoreFile, merchant: string): PaymentPolicy[] {
@@ -307,10 +310,10 @@ export function decideMachinePolicy(store: StoreFile, input: MachinePolicyInput)
       },
       denial: {
         id: `den_${randomBytes(8).toString("hex")}`,
-        merchant: isAddress(input.merchant) ? getAddress(input.merchant) : input.merchant,
+        merchant: canonicalizeAddress(input.merchant) ?? input.merchant,
         agentId: input.agentId,
-        recipient: isAddress(input.recipient) ? getAddress(input.recipient) : input.recipient,
-        token: isAddress(input.token) ? getAddress(input.token) : input.token,
+        recipient: canonicalizeAddress(input.recipient) ?? input.recipient,
+        token: canonicalizeAddress(input.token) ?? input.token,
         chainId: input.chainId ?? 0,
         amountBaseUnits: input.amount?.toString() ?? "0",
         evaluatedAt: input.now,
@@ -323,15 +326,19 @@ export function decideMachinePolicy(store: StoreFile, input: MachinePolicyInput)
   }
   const enabled = enabledPolicies(store, input.merchant);
   if (enabled.length === 0) return { kind: "skip" };
-  if (input.amount == null || input.chainId == null || !isAddress(input.recipient) || !isAddress(input.token)) {
+  // Normalize with the same non-strict admission as V2 parseAddress before any
+  // allow/deny/defer decision so casing cannot skip an enabled policy.
+  const recipient = canonicalizeAddress(input.recipient);
+  const token = canonicalizeAddress(input.token);
+  if (input.amount == null || input.chainId == null || !recipient || !token) {
     return { kind: "defer" };
   }
   const amountBaseUnits = input.amount.toString();
   const decision = evaluatePaymentPolicy({
     merchant: input.merchant,
     agentId: input.agentId,
-    recipient: input.recipient,
-    token: input.token,
+    recipient,
+    token,
     chainId: input.chainId,
     amountBaseUnits,
     now: input.now,
@@ -360,10 +367,10 @@ export function decideMachinePolicy(store: StoreFile, input: MachinePolicyInput)
       decision: denied,
       denial: {
         id: `den_${randomBytes(8).toString("hex")}`,
-        merchant: getAddress(input.merchant),
+        merchant: canonicalizeAddress(input.merchant) ?? input.merchant,
         agentId: input.agentId,
-        recipient: getAddress(input.recipient),
-        token: getAddress(input.token),
+        recipient,
+        token,
         chainId: input.chainId,
         amountBaseUnits,
         evaluatedAt: input.now,
@@ -385,7 +392,7 @@ export function decideMachinePolicy(store: StoreFile, input: MachinePolicyInput)
     reservation: {
       id: input.requestId.toLowerCase(),
       intentId: input.requestId.toLowerCase(),
-      merchant: getAddress(input.merchant),
+      merchant: canonicalizeAddress(input.merchant) ?? input.merchant,
       amountBaseUnits,
       policyIds: enabled.filter((policy) => policy.rules.maxSpendBaseUnits !== undefined).map((policy) => policy.id),
       reservedAt: input.now,

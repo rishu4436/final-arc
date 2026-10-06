@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import type { Address, Hex } from "viem";
+import { getAddress, isAddress, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { hashApiSecret, type ApiKeyRecord, type ApiKeyRuntime } from "./apiKeys";
 import { API_SCOPES, DEFAULT_API_KEY_SCOPES, WALLET_ACTIONS, type ApiScope } from "./apiScopes";
@@ -22,6 +22,7 @@ import {
 } from "./paymentPolicy";
 import {
   createPolicy,
+  decideMachinePolicy,
   deletePolicy,
   getPolicy,
   listPolicies,
@@ -1302,4 +1303,241 @@ test("11.1 policy, ledger, and reservation code: no reconciliation, signing, RPC
   const pure = readFileSync("src/lib/paymentPolicy.ts", "utf8");
   assert.equal(pure.includes("fetch("), false);
   assert.equal(pure.includes("./payStore"), false);
+});
+
+/** Accepted non-canonical forms that V2 admits via isAddress(..., { strict: false }). */
+function addressForms(canonical: string): { label: string; value: string }[] {
+  const checksummed = getAddress(canonical);
+  const lower = checksummed.toLowerCase();
+  const upper = ("0x" + checksummed.slice(2).toUpperCase()) as string;
+  let wrongChecksum = checksummed;
+  for (let i = 2; i < checksummed.length; i++) {
+    const ch = checksummed[i]!;
+    if (ch >= "a" && ch <= "f") {
+      const cand = checksummed.slice(0, i) + ch.toUpperCase() + checksummed.slice(i + 1);
+      if (isAddress(cand, { strict: false }) && !isAddress(cand, { strict: true })) {
+        wrongChecksum = cand;
+        break;
+      }
+    } else if (ch >= "A" && ch <= "F") {
+      const cand = checksummed.slice(0, i) + ch.toLowerCase() + checksummed.slice(i + 1);
+      if (isAddress(cand, { strict: false }) && !isAddress(cand, { strict: true })) {
+        wrongChecksum = cand;
+        break;
+      }
+    }
+  }
+  return [
+    { label: "checksum", value: checksummed },
+    { label: "lowercase", value: lower },
+    { label: "uppercase", value: upper },
+    { label: "wrong-checksum", value: wrongChecksum },
+  ];
+}
+
+test("address-normalization: denying recipient policy cannot be skipped via non-canonical casing", async () => {
+  const blocked = "0x0000000000000000000000000000000000000001";
+  const forms = addressForms(merchant.address);
+  assert.equal(isAddress(forms.find((f) => f.label === "uppercase")!.value, { strict: true }), false);
+  assert.equal(isAddress(forms.find((f) => f.label === "wrong-checksum")!.value, { strict: true }), false);
+
+  for (const [index, form] of forms.entries()) {
+    const h = box();
+    putPolicy(h.blob, policy({ rules: { allowedRecipients: [blocked] } }));
+    const n = index + 1;
+    const requestId = (`0x${n.toString(16).padStart(2, "0").repeat(16)}`) as Hex;
+    const nonce = (`0x${(n + 0x10).toString(16).padStart(2, "0").repeat(32)}`) as Hex;
+    const signed = await signedBody({ requestId, nonce }, { recipient: form.value, merchant: form.value });
+    const denied = await createAgentPaymentIntent(post(signed, `deny-${form.label}`), h.deps);
+    assert.equal(denied.status, 403, `${form.label} must be denied`);
+    assert.equal(errorOf(denied.body).code, "policy_denied", `${form.label} code`);
+    assert.equal(errorOf(denied.body).reasons?.[0]?.code, "RECIPIENT_NOT_ALLOWED", `${form.label} reason`);
+    assert.equal(Object.keys(h.blob.records).length, 0, `${form.label} must not store V2`);
+    assert.equal(Object.keys(h.blob.agents?.intents ?? {}).length, 0, `${form.label} must not store intent`);
+    assert.equal(Object.keys(ledgerRows(h)).length, 0, `${form.label} must not reserve`);
+  }
+});
+
+test("address-normalization: non-canonical recipient cannot yield policy:null under an enabled policy", async () => {
+  const forms = addressForms(merchant.address).filter((f) => f.label === "uppercase" || f.label === "wrong-checksum");
+  for (const [index, form] of forms.entries()) {
+    const h = box();
+    putPolicy(h.blob, policy({ rules: { maxAmountBaseUnits: "1" } }));
+    const n = index + 0x20;
+    const requestId = (`0x${n.toString(16).padStart(2, "0").repeat(16)}`) as Hex;
+    const nonce = (`0x${(n + 1).toString(16).padStart(2, "0").repeat(32)}`) as Hex;
+    const signed = await signedBody({ requestId, nonce, amountBaseUnits: 1_000_000n }, {
+      recipient: form.value,
+      merchant: form.value,
+    });
+    const result = await createAgentPaymentIntent(post(signed, `null-${form.label}`), h.deps);
+    assert.equal(result.status, 403, `${form.label} must not become executable`);
+    // Denial responses carry reasons, never an executable intent with policy:null.
+    assert.equal("policy" in (result.body as object) && (result.body as { policy: unknown }).policy == null, false);
+    assert.equal(Object.keys(h.blob.records).length, 0);
+    assert.equal(Object.keys(ledgerRows(h)).length, 0);
+  }
+});
+
+test("address-normalization: allowed recipient succeeds for every accepted representation", async () => {
+  for (const [index, form] of addressForms(merchant.address).entries()) {
+    const h = box();
+    putPolicy(h.blob, policy({ rules: { allowedRecipients: [merchant.address.toLowerCase()], maxAmountBaseUnits: "1000000" } }));
+    const n = index + 0x30;
+    const requestId = (`0x${n.toString(16).padStart(2, "0").repeat(16)}`) as Hex;
+    const nonce = (`0x${(n + 1).toString(16).padStart(2, "0").repeat(32)}`) as Hex;
+    const signed = await signedBody({ requestId, nonce, amountBaseUnits: 500_000n }, {
+      recipient: form.value,
+      merchant: form.value,
+    });
+    const result = await createAgentPaymentIntent(post(signed, `allow-${form.label}`), h.deps);
+    assert.equal(result.status, 200, `${form.label} must be allowed`);
+    const intent = result.body as { policy: PolicySnapshot | null; instruction: { data: string } | null; status: string };
+    assert.equal(intent.policy?.decision, "allowed", `${form.label} policy`);
+    assert.ok(intent.instruction?.data, `${form.label} must return unsigned calldata`);
+    assert.equal(intent.status, "AWAITING_PAYMENT");
+  }
+});
+
+test("address-normalization: spend-cap reservation is identical across accepted representations", async () => {
+  for (const [index, form] of addressForms(merchant.address).entries()) {
+    const h = box();
+    putPolicy(h.blob, policy({ rules: { maxSpendBaseUnits: "2000000", windowSeconds: 86_400 } }));
+    const n = index + 0x40;
+    const requestId = (`0x${n.toString(16).padStart(2, "0").repeat(16)}`) as Hex;
+    const nonce = (`0x${(n + 1).toString(16).padStart(2, "0").repeat(32)}`) as Hex;
+    const signed = await signedBody({ requestId, nonce, amountBaseUnits: 1_000_000n }, {
+      recipient: form.value,
+      merchant: form.value,
+    });
+    const result = await createAgentPaymentIntent(post(signed, `spend-${form.label}`), h.deps);
+    assert.equal(result.status, 200, `${form.label}`);
+    const rows = Object.values(ledgerRows(h)).filter((row) => row.status === "RESERVED");
+    assert.equal(rows.length, 1, `${form.label} reservation`);
+    assert.equal(rows[0]?.amountBaseUnits, "1000000");
+  }
+});
+
+test("address-normalization: decideMachinePolicy is representation-stable for the same 20 bytes", () => {
+  const h = box();
+  putPolicy(h.blob, policy({ rules: { allowedRecipients: [merchant.address], maxAmountBaseUnits: "1000000" } }));
+  const canonical = getAddress(merchant.address);
+  const base = {
+    merchant: merchant.address,
+    agentId: "desk-1",
+    token: USDC_ADDRESS,
+    chainId: ARC_CHAIN_ID,
+    amount: 500_000n,
+    requestId: REQUEST_ID,
+    now: NOW,
+    willExecute: true,
+    expiresAt: EXPIRES_AT,
+  };
+  const expected = decideMachinePolicy(h.blob, { ...base, recipient: canonical });
+  assert.equal(expected.kind, "allow");
+  for (const form of addressForms(merchant.address)) {
+    const plan = decideMachinePolicy(h.blob, { ...base, recipient: form.value });
+    assert.equal(plan.kind, expected.kind, `${form.label} kind`);
+    if (plan.kind === "allow" && expected.kind === "allow") {
+      assert.equal(plan.snapshot.decision, expected.snapshot.decision);
+      assert.deepEqual(plan.snapshot.policyIds, expected.snapshot.policyIds);
+    }
+  }
+  // Denying allowlist must deny every accepted representation — never defer.
+  putPolicy(h.blob, policy({ rules: { allowedRecipients: ["0x0000000000000000000000000000000000000001"] } }));
+  for (const form of addressForms(merchant.address)) {
+    const plan = decideMachinePolicy(h.blob, { ...base, recipient: form.value });
+    assert.equal(plan.kind, "deny", `${form.label} must deny, not defer/skip`);
+  }
+});
+
+test("address-normalization: invalid recipient stays a validation failure, not a silent policy skip to execution", async () => {
+  const h = box();
+  putPolicy(h.blob, policy({ rules: { maxAmountBaseUnits: "1000000" } }));
+  const signed = await signedBody({}, { recipient: "not-an-address" });
+  const result = await createAgentPaymentIntent(post(signed, "invalid-recipient"), h.deps);
+  assert.equal(result.status >= 400, true);
+  assert.notEqual(result.status, 200);
+  assert.equal(Object.keys(h.blob.records).length, 0);
+  assert.equal(Object.keys(ledgerRows(h)).length, 0);
+});
+
+test("address-normalization: different recipient remains denied under allowlist", async () => {
+  const h = box();
+  putPolicy(h.blob, policy({ rules: { allowedRecipients: [merchant.address] } }));
+  // Different recipient is rejected before an executable intent exists (policy deny and/or V2 merchant===recipient).
+  const signed = await signedBody({}, { recipient: other.address });
+  const result = await createAgentPaymentIntent(post(signed, "other-recipient"), h.deps);
+  assert.notEqual(result.status, 200);
+  assert.equal(result.status >= 400, true);
+  assert.equal(Object.keys(h.blob.records).length, 0);
+  assert.equal(Object.keys(ledgerRows(h)).length, 0);
+});
+
+test("address-normalization: merchant alternate casing does not create ownership ambiguity on agent create", async () => {
+  const h = box();
+  putPolicy(h.blob, policy({ rules: { maxAmountBaseUnits: "1000000" } }));
+  const upper = "0x" + merchant.address.slice(2).toUpperCase();
+  const requestId = ("0x" + "51".repeat(16)) as Hex;
+  const nonce = ("0x" + "52".repeat(32)) as Hex;
+  const signed = await signedBody({ requestId, nonce }, { merchant: upper, recipient: upper });
+  const result = await createAgentPaymentIntent(post(signed, "merchant-upper"), h.deps);
+  assert.equal(result.status, 200);
+  const intent = result.body as { merchant: string; policy: PolicySnapshot | null };
+  assert.equal(getAddress(intent.merchant), merchant.address);
+  assert.equal(intent.policy?.decision, "allowed");
+});
+
+test("address-normalization: different merchant API key still cannot create for another wallet", async () => {
+  const h = box();
+  putPolicy(h.blob, policy({ rules: { maxAmountBaseUnits: "1000000" } }));
+  // Sign as merchant but authenticate as... we only have merchant key in box(); forge by swapping merchant field to other uppercase.
+  const fields = validateFinalRequest(draft({ merchant: other.address, recipient: other.address, memo: "x-merchant", requestId: ("0x" + "61".repeat(16)) as Hex, nonce: ("0x" + "62".repeat(32)) as Hex }));
+  const signed = await signFinalRequest(fields, other);
+  const upperOther = "0x" + other.address.slice(2).toUpperCase();
+  const body = {
+    requestId: signed.requestId,
+    merchant: upperOther,
+    recipient: upperOther,
+    amountBaseUnits: signed.amountBaseUnits.toString(),
+    memo: signed.memo,
+    chainId: signed.chainId,
+    expiresAt: signed.expiresAt,
+    nonce: signed.nonce,
+    signature: signed.signature,
+    agentId: "desk-1",
+  };
+  const denied = await createAgentPaymentIntent(post(body, "cross-merchant-upper"), h.deps);
+  assert.equal(denied.status, 403);
+  assert.equal(Object.keys(h.blob.records).length, 0);
+});
+
+test("address-normalization: forged signature still fails and agentId remains a label filter", async () => {
+  const h = box();
+  putPolicy(h.blob, policy({ rules: { allowedAgentIds: ["desk-1"], maxAmountBaseUnits: "1000000" } }));
+  const signed = await signedBody({}, { signature: ("0x" + "ab".repeat(65)) as Hex, agentId: "desk-1" });
+  const forged = await createAgentPaymentIntent(post(signed, "forged-sig"), h.deps);
+  assert.equal(forged.status, 400);
+  assert.equal(Object.keys(h.blob.records).length, 0);
+  const blockedAgent = await createAgentPaymentIntent(
+    post(await signedBody({ requestId: ("0x" + "71".repeat(16)) as Hex, nonce: ("0x" + "72".repeat(32)) as Hex }, { agentId: "other-agent" }), "bad-agent"),
+    h.deps,
+  );
+  assert.equal(blockedAgent.status, 403);
+  assert.equal(errorOf(blockedAgent.body).reasons?.[0]?.code, "AGENT_NOT_ALLOWED");
+});
+
+test("address-normalization: signing boundary unchanged — create returns unsigned calldata only", async () => {
+  const h = box();
+  putPolicy(h.blob, policy({ rules: { maxAmountBaseUnits: "1000000" } }));
+  const created = await createAgentPaymentIntent(post(await signedBody({ requestId: ("0x" + "81".repeat(16)) as Hex, nonce: ("0x" + "82".repeat(32)) as Hex }), "boundary"), h.deps);
+  assert.equal(created.status, 200);
+  const body = created.body as { instruction: { to: string; data: string; value: string } | null; signature?: unknown };
+  assert.ok(body.instruction?.data);
+  assert.equal(body.instruction?.value, "0");
+  assert.equal("signature" in body && body.signature != null, false);
+  const src = readFileSync("src/lib/agentPayments.ts", "utf8");
+  for (const banned of ["sendRawTransaction", "sendTransaction", "writeContract", "createWalletClient"]) {
+    assert.equal(src.includes(banned), false, banned);
+  }
 });
