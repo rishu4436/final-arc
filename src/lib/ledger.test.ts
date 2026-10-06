@@ -119,7 +119,7 @@ function idleDeps(): PayStatusDeps {
     loadMemoLedger,
     // Phase 13: /api/statement requires the authenticated merchant to equal the address.
     authorize: async () => ({ ok: true as const, merchant: ACCOUNT }),
-    countOwnedRecords: async () => 0,
+    createOwnedRecord: async (record) => ({ record, created: true }),
     rateLimit: () => true,
     clientKey: () => "ip:test",
   };

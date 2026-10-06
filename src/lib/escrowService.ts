@@ -40,7 +40,12 @@ export type EscrowDeps = {
   nowSeconds: () => number;
   chain: EscrowChainPort;
   list: () => Promise<EscrowRecord[]>;
-  save: (row: EscrowRecord) => Promise<void>;
+  /**
+   * Persist an escrow row. Returns true only when a new row or a state transition
+   * was written. Same-state field updates and rejected regressions return false
+   * so callers do not emit transition webhooks.
+   */
+  save: (row: EscrowRecord) => Promise<boolean>;
   emit: (type: EmittableWebhookEvent, merchant: string, data: Record<string, unknown>) => void;
   runtime: ApiKeyRuntime;
 };
@@ -225,8 +230,12 @@ export async function createEscrow(request: Request, deps: EscrowDeps): Promise<
     cancelTxHash: null,
     usedNonces: [],
   };
-  await deps.save(row);
-  deps.emit("escrow.created", row.creator, eventData(row));
+  const persisted = await deps.save(row);
+  if (persisted) deps.emit("escrow.created", row.creator, eventData(row));
+  else {
+    const existingAfter = (await deps.list()).find((item) => item.escrowId.toLowerCase() === escrowId.toLowerCase());
+    if (existingAfter) return { status: 200, body: { escrow: publicEscrow(existingAfter, deps.chain) } };
+  }
   return { status: 200, body: { escrow: publicEscrow(row, deps.chain) } };
 }
 
@@ -515,7 +524,11 @@ async function applyChainTransition(
     cancelTxHash: input.action === "cancel" ? (input.txHash as Hex) : row.cancelTxHash,
     usedNonces: input.nonce ? [...row.usedNonces, input.nonce] : row.usedNonces,
   };
-  await deps.save(updated);
+  const persisted = await deps.save(updated);
+  if (!persisted) {
+    const current = (await deps.list()).find((item) => item.escrowId.toLowerCase() === row.escrowId.toLowerCase()) ?? row;
+    return { status: 200, body: { escrow: publicEscrow(current, deps.chain), verified: true } };
+  }
   const type: EmittableWebhookEvent =
     next.state === "OPEN"
       ? "escrow.opened"
@@ -722,16 +735,22 @@ export function liveEscrowDeps(runtime: ApiKeyRuntime = liveApiKeyRuntime()): Es
         .filter((row): row is EscrowRecord => row !== null);
     },
     async save(row) {
+      let persisted = false;
       await mutatePayStoreBlob((store) => {
         const section = ensureSection(store);
         const key = row.escrowId.toLowerCase();
         const existing = asEscrowRecord(section.records[key]);
         if (existing && !canPersistEscrowState(existing.state, row.state)) {
           // Stale writer must not regress FUNDED→CREATED or overwrite a terminal state.
+          persisted = false;
           return;
         }
+        const stateChanged = !existing || existing.state !== row.state;
         section.records[key] = row;
+        // Transition/create only — same-state field updates do not emit webhooks.
+        persisted = stateChanged;
       });
+      return persisted;
     },
     emit(type, merchant, data) {
       safeEmitWebhookEvent({ type, merchant, data });

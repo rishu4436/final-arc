@@ -93,6 +93,11 @@ function harness(scopes: readonly ApiScope[] = ["agent:read", "agent:write"]): H
       if (index >= 0) keys[index] = row;
       else keys.push(row);
     },
+    createKey: async (row) => {
+      const index = keys.findIndex((item) => item.id === row.id);
+      if (index >= 0) keys[index] = row;
+      else keys.push(row);
+    },
     touchLastUsed: async () => undefined,
   };
   const deps: AgentPaymentsDeps = {
@@ -104,6 +109,16 @@ function harness(scopes: readonly ApiScope[] = ["agent:read", "agent:write"]): H
       const next = mergePayRecord(blob.records[record.token], record);
       blob.records[record.token] = next;
       return next;
+    },
+    createOwnedRecord: async (record) => {
+      const existing = blob.records[record.token];
+      if (existing) {
+        const next = mergePayRecord(existing, record);
+        blob.records[record.token] = next;
+        return { record: next, created: false };
+      }
+      blob.records[record.token] = record;
+      return { record, created: true };
     },
     listRecords: async () => Object.values(blob.records),
     loadReceipt: async () => ({ error: "Transaction not found on Arc mainnet.", status: 404 }),
@@ -662,6 +677,16 @@ test("intent writes keep payments, webhooks, api keys, and escrows", async () =>
     const next = mergePayRecord(canonical.records[record.token], record);
     canonical.records[record.token] = next;
     return next;
+  };
+  h.deps.createOwnedRecord = async (record) => {
+    const existing = canonical.records[record.token];
+    if (existing) {
+      const next = mergePayRecord(existing, record);
+      canonical.records[record.token] = next;
+      return { record: next, created: false };
+    }
+    canonical.records[record.token] = record;
+    return { record, created: true };
   };
   h.deps.listRecords = async () => Object.values(canonical.records);
   const created = intentOf(await createAgentPaymentIntent(post(await signedBody()), h.deps));

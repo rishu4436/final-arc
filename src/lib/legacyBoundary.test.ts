@@ -37,7 +37,9 @@ import {
   MAX_ACTIVE_API_KEYS_PER_MERCHANT,
   MAX_PAYMENT_RECORDS_PER_MERCHANT,
   MAX_POLICIES_PER_MERCHANT,
+  MAX_STORED_API_KEYS_PER_MERCHANT,
   MAX_WEBHOOK_ENDPOINTS_PER_MERCHANT,
+  ResourceLimitExceededError,
   countPayRecordsOwnedBy,
   ownsPayRecord,
   payRecordOwner,
@@ -167,6 +169,18 @@ function keyRuntime(keys: ApiKeyRecord[] = [], pepper: string | null = PEPPER) {
       if (i >= 0) rows[i] = next;
       else rows.push(next);
     },
+    createKey: async (next) => {
+      const merchant = getAddress(next.merchant);
+      const mine = rows.filter((k) => getAddress(k.merchant) === merchant);
+      if (mine.filter((k) => !k.revoked).length >= MAX_ACTIVE_API_KEYS_PER_MERCHANT) {
+        throw new ResourceLimitExceededError("Active API key limit reached. Revoke an unused key first.");
+      }
+      if (mine.length >= MAX_STORED_API_KEYS_PER_MERCHANT) {
+        throw new ResourceLimitExceededError("API key limit reached for this merchant.");
+      }
+      upserts += 1;
+      rows.push(next);
+    },
     touchLastUsed: async () => {},
   };
   return { runtime, rows, upserts: () => upserts };
@@ -216,6 +230,21 @@ function memoryDeps(seed: PayRecord[] = [], opts: { keys?: ApiKeyRecord[]; limit
       records.set(record.token, next);
       return structuredClone(next);
     },
+    async createOwnedRecord(record, owner) {
+      calls.write += 1;
+      calls.count += 1;
+      const existing = records.get(record.token);
+      if (existing) {
+        const next = mergePayRecord(existing, record);
+        records.set(record.token, next);
+        return { record: structuredClone(next), created: false };
+      }
+      if (countPayRecordsOwnedBy(records.values(), owner) >= MAX_PAYMENT_RECORDS_PER_MERCHANT) {
+        throw new ResourceLimitExceededError("Payment request limit reached for this merchant.");
+      }
+      records.set(record.token, record);
+      return { record: structuredClone(record), created: true };
+    },
     async findSettlementProof() {
       calls.find += 1;
       return null;
@@ -227,10 +256,6 @@ function memoryDeps(seed: PayRecord[] = [], opts: { keys?: ApiKeyRecord[]; limit
     authorize: async (request, o) => {
       calls.authorize += 1;
       return authorizeHttp(request, o, keys.runtime);
-    },
-    countOwnedRecords: async (owner) => {
-      calls.count += 1;
-      return countPayRecordsOwnedBy(records.values(), owner);
     },
     rateLimit: opts.limiter ?? (() => true),
     clientKey: () => "ip:test",
@@ -469,7 +494,9 @@ test("P1-03 #9: cross-merchant registration fails and wrong wallet action is rej
 test("P1-03 #10: per-merchant record cap returns 409 and public writes are rate limited before any work", async () => {
   const { token } = await v2Token(KEY_A, { merchant: A.address });
   const box = memoryDeps();
-  box.deps.countOwnedRecords = async () => MAX_PAYMENT_RECORDS_PER_MERCHANT;
+  box.deps.createOwnedRecord = async () => {
+    throw new ResourceLimitExceededError("Payment request limit reached for this merchant.");
+  };
   const capped = await payPost(post({ token }), box.deps);
   assert.equal(capped.status, 409);
   assert.equal(errorCode(capped.body), LIMIT_EXCEEDED_CODE);

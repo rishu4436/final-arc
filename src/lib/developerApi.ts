@@ -24,8 +24,8 @@ import { loadReceipt, type LoadedReceipt } from "./loadReceipt";
 import { payRecordIdentity } from "./payPaid";
 import { decodePayLink, paymentLinkPhase, sealSignedV2Request, type PayLinkPhase } from "./payRequest";
 import { isTxHash } from "./receipt";
-import { getRecord, listRecords, upsertRecord, type PayRecord } from "./payStore";
-import { LIMIT_EXCEEDED_CODE, MAX_PAYMENT_RECORDS_PER_MERCHANT, countPayRecordsOwnedBy } from "./resourceLimits";
+import { createPayRecord, listRecords, upsertRecord, type PayRecord } from "./payStore";
+import { LIMIT_EXCEEDED_CODE, ResourceLimitExceededError } from "./resourceLimits";
 import { emitPaymentRequestCreated } from "./webhooks";
 
 /**
@@ -175,6 +175,8 @@ export type DeveloperApiDeps = {
   nowSeconds: () => number;
   origin: string;
   upsertRecord: (record: PayRecord) => Promise<PayRecord>;
+  /** Atomic create-or-merge with per-merchant create cap on the CAS snapshot. */
+  createOwnedRecord: (record: PayRecord, owner: Address) => Promise<{ record: PayRecord; created: boolean }>;
   listRecords: () => Promise<PayRecord[]>;
   loadReceipt: (hash: string) => Promise<LoadedReceipt | { error: string; status: number }>;
   /** Bearer header for GET handlers. POST reads the Request header first. */
@@ -539,32 +541,20 @@ export async function createPaymentRequest(
     if (!identity || identity.version !== 2) {
       fail(500, API_ERROR_CODES.internal, "Could not store the payment request.");
     }
-    let existed = false;
-    try {
-      existed = (await getRecord(sealed.token)) != null;
-    } catch {
-      fail(503, API_ERROR_CODES.storeUnavailable, "Payment store is unavailable.");
-    }
-    if (!existed) {
-      // Phase 13 (P1-03): per-merchant stored-row ceiling, same constant as legacy registration.
-      let owned: number;
-      try {
-        owned = countPayRecordsOwnedBy(await deps.listRecords(), sealed.request.merchant);
-      } catch {
-        fail(503, API_ERROR_CODES.storeUnavailable, "Payment store is unavailable.");
-      }
-      if (owned >= MAX_PAYMENT_RECORDS_PER_MERCHANT) {
-        fail(409, LIMIT_EXCEEDED_CODE, "Payment request limit reached for this merchant.");
-      }
-    }
     let row: PayRecord;
+    let created = false;
     try {
-      row = await deps.upsertRecord(blankRecord(sealed.token, identity));
-    } catch {
+      const result = await deps.createOwnedRecord(blankRecord(sealed.token, identity), sealed.request.merchant);
+      row = result.record;
+      created = result.created;
+    } catch (err) {
+      if (err instanceof ResourceLimitExceededError) {
+        fail(409, LIMIT_EXCEEDED_CODE, err.message);
+      }
       fail(503, API_ERROR_CODES.storeUnavailable, "Payment store is unavailable.");
     }
     // First store of this token only. A later /api/pay register of the same token does not re-emit.
-    if (!existed) emitPaymentRequestCreated(row);
+    if (created) emitPaymentRequestCreated(row);
     return {
       status: 200,
       body: toPaymentResource(row, sealed.request, deps.origin, deps.nowSeconds()),
@@ -737,6 +727,7 @@ export function liveDeveloperApiDeps(authorization: string | null = null): Devel
     nowSeconds: () => Math.floor(Date.now() / 1000),
     origin: siteOrigin(),
     upsertRecord,
+    createOwnedRecord: createPayRecord,
     listRecords,
     loadReceipt,
     authorization,

@@ -361,6 +361,9 @@ function harness(opts: { ledger?: "redis" | "unavailable"; blob?: StoreFile; rea
     upsertKey: async () => {
       throw new Error("analytics must not upsert keys");
     },
+    createKey: async () => {
+      throw new Error("analytics must not create keys");
+    },
     touchLastUsed: async (id) => {
       h.touched.push(id);
     },

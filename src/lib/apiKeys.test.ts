@@ -35,6 +35,13 @@ import type { LoadedReceipt } from "./loadReceipt";
 import { encodeV2PayRequest } from "./payRequest";
 import { getRecord, upsertRecord, type PayRecord } from "./payStore";
 import {
+  MAX_ACTIVE_API_KEYS_PER_MERCHANT,
+  MAX_PAYMENT_RECORDS_PER_MERCHANT,
+  MAX_STORED_API_KEYS_PER_MERCHANT,
+  ResourceLimitExceededError,
+  countPayRecordsOwnedBy,
+} from "./resourceLimits";
+import {
   createWebhookEndpoint,
   deleteWebhookEndpoint,
   getWebhookEndpoint,
@@ -106,6 +113,17 @@ function memoryRuntime(seed: ApiKeyRecord[] = [], now = NOW) {
       if (index >= 0) keys[index] = { ...row, scopes: [...row.scopes] };
       else keys.push({ ...row, scopes: [...row.scopes] });
     },
+    createKey: async (row) => {
+      const merchant = getAddress(row.merchant);
+      const mine = keys.filter((key) => getAddress(key.merchant) === merchant);
+      if (mine.filter((key) => !key.revoked).length >= MAX_ACTIVE_API_KEYS_PER_MERCHANT) {
+        throw new ResourceLimitExceededError("Active API key limit reached. Revoke an unused key first.");
+      }
+      if (mine.length >= MAX_STORED_API_KEYS_PER_MERCHANT) {
+        throw new ResourceLimitExceededError("API key limit reached for this merchant.");
+      }
+      keys.push({ ...row, scopes: [...row.scopes] });
+    },
     touchLastUsed: async (id, iso) => {
       touches += 1;
       const row = keys.find((key) => key.id === id);
@@ -151,6 +169,18 @@ function payDeps(runtime: ApiKeyRuntime, authorization: string | null, rows: Pay
       if (index >= 0) rows[index] = record;
       else rows.push(record);
       return record;
+    },
+    createOwnedRecord: async (record, owner) => {
+      const index = rows.findIndex((row) => row.token === record.token);
+      if (index >= 0) {
+        rows[index] = record;
+        return { record, created: false };
+      }
+      if (countPayRecordsOwnedBy(rows, owner) >= MAX_PAYMENT_RECORDS_PER_MERCHANT) {
+        throw new ResourceLimitExceededError("Payment request limit reached for this merchant.");
+      }
+      rows.push(record);
+      return { record, created: true };
     },
     listRecords: async () => rows.slice(),
     loadReceipt: async () => ({ error: "Transaction not found on Arc mainnet.", status: 404 }),

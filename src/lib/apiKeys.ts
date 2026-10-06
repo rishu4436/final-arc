@@ -13,9 +13,9 @@ import {
 } from "./apiScopes";
 import { mutatePayStoreBlob, readPayStoreBlob, type ApiKeyStoreSection } from "./payStore";
 import {
-  LIMIT_EXCEEDED_CODE,
   MAX_ACTIVE_API_KEYS_PER_MERCHANT,
   MAX_STORED_API_KEYS_PER_MERCHANT,
+  ResourceLimitExceededError,
 } from "./resourceLimits";
 
 /**
@@ -77,6 +77,11 @@ export type ApiKeyRuntime = {
   rateLimitPerMinute?: number;
   listKeys: () => Promise<ApiKeyRecord[]>;
   upsertKey: (row: ApiKeyRecord) => Promise<void>;
+  /**
+   * Atomic create with per-merchant caps evaluated on the latest store snapshot.
+   * Secret/id must be generated before this call so CAS retries reuse them.
+   */
+  createKey: (row: ApiKeyRecord) => Promise<void>;
   touchLastUsed: (id: string, iso: string) => Promise<void>;
 };
 
@@ -322,6 +327,22 @@ export function liveApiKeyRuntime(): ApiKeyRuntime {
         ensureSection(store).keys[row.id] = row;
       });
     },
+    async createKey(row) {
+      await mutatePayStoreBlob((store) => {
+        const section = ensureSection(store);
+        const merchant = getAddress(row.merchant);
+        const mine = Object.values(section.keys)
+          .map(asApiKeyRecord)
+          .filter((existing): existing is ApiKeyRecord => !!existing && isAddress(existing.merchant) && getAddress(existing.merchant) === merchant);
+        if (mine.filter((existing) => !existing.revoked).length >= MAX_ACTIVE_API_KEYS_PER_MERCHANT) {
+          throw new ResourceLimitExceededError("Active API key limit reached. Revoke an unused key first.");
+        }
+        if (mine.length >= MAX_STORED_API_KEYS_PER_MERCHANT) {
+          throw new ResourceLimitExceededError("API key limit reached for this merchant.");
+        }
+        section.keys[row.id] = row;
+      });
+    },
     async touchLastUsed(id, iso) {
       await mutatePayStoreBlob((store) => {
         const current = asApiKeyRecord(ensureSection(store).keys[id]);
@@ -418,21 +439,7 @@ export async function handleCreateApiKey(request: Request, runtime: ApiKeyRuntim
   if (typeof pepper !== "string") return apiError(pepper.status, pepper.code, pepper.message);
 
   // Phase 13 (P1-03): per-merchant key ceilings. Revoked keys stay stored, so both
-  // active and stored rows are capped. Not atomic across instances (P1-02).
-  let existingKeys: ApiKeyRecord[];
-  try {
-    existingKeys = await runtime.listKeys();
-  } catch {
-    return apiError(503, "store_unavailable", "Payment store is unavailable.");
-  }
-  const mine = existingKeys.filter((row) => isAddress(row.merchant) && getAddress(row.merchant) === auth.merchant);
-  if (mine.filter((row) => !row.revoked).length >= MAX_ACTIVE_API_KEYS_PER_MERCHANT) {
-    return apiError(409, LIMIT_EXCEEDED_CODE, "Active API key limit reached. Revoke an unused key first.");
-  }
-  if (mine.length >= MAX_STORED_API_KEYS_PER_MERCHANT) {
-    return apiError(409, LIMIT_EXCEEDED_CODE, "API key limit reached for this merchant.");
-  }
-
+  // active and stored rows are capped. Caps are enforced inside createKey's CAS mutator.
   let expiresAt: string | null = null;
   if (body.expiresAt !== undefined && body.expiresAt !== null) {
     if (typeof body.expiresAt !== "number" || !Number.isSafeInteger(body.expiresAt)) {
@@ -444,6 +451,7 @@ export async function handleCreateApiKey(request: Request, runtime: ApiKeyRuntim
     expiresAt = new Date(body.expiresAt * 1000).toISOString();
   }
 
+  // Generate secret/id before the CAS mutator so retries reuse the same material.
   const secret = generateApiSecret();
   const now = new Date(runtime.nowSeconds() * 1000).toISOString();
   const row: ApiKeyRecord = {
@@ -460,8 +468,11 @@ export async function handleCreateApiKey(request: Request, runtime: ApiKeyRuntim
     expiresAt,
   };
   try {
-    await runtime.upsertKey(row);
-  } catch {
+    await runtime.createKey(row);
+  } catch (err) {
+    if (err instanceof ResourceLimitExceededError) {
+      return apiError(err.status, err.code, err.message);
+    }
     return apiError(503, "store_unavailable", "Payment store is unavailable.");
   }
   return { status: 200, body: { ...toPublicApiKey(row), secret } };

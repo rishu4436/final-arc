@@ -82,6 +82,7 @@ function runtime(row: ApiKeyRecord, now = NOW): ApiKeyRuntime {
     pepper: PEPPER,
     listKeys: async () => keys,
     upsertKey: async () => undefined,
+    createKey: async () => undefined,
     touchLastUsed: async () => undefined,
   };
 }
@@ -130,7 +131,11 @@ function harness(now = NOW) {
     list: async () => [...rows.values()],
     save: async (row) => {
       saves += 1;
-      rows.set(row.escrowId.toLowerCase(), row);
+      const key = row.escrowId.toLowerCase();
+      const existing = rows.get(key);
+      const transitioned = !existing || existing.state !== row.state;
+      rows.set(key, row);
+      return transitioned;
     },
     emit: (type) => {
       events.push(type);

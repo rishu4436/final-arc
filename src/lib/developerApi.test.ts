@@ -32,6 +32,11 @@ import { hashApiSecret, type ApiKeyRecord, type ApiKeyRuntime } from "./apiKeys"
 import { API_SCOPES } from "./apiScopes";
 import { deriveMemoId, finalRequestTypedData, signFinalRequest, validateFinalRequest, type FinalRequestDraft } from "./finalRequest";
 import type { LoadedReceipt } from "./loadReceipt";
+import {
+  MAX_PAYMENT_RECORDS_PER_MERCHANT,
+  ResourceLimitExceededError,
+  countPayRecordsOwnedBy,
+} from "./resourceLimits";
 import { mergePayRecord, type PayRecord } from "./payStore";
 import { decodePayRequest, encodePayRequest } from "./payRequest";
 import { checkCertificate, parseMemoReceipt } from "./receipt";
@@ -99,6 +104,11 @@ function memory(now = NOW) {
       if (index >= 0) keys[index] = row;
       else keys.push(row);
     },
+    createKey: async (row) => {
+      const index = keys.findIndex((key) => key.id === row.id);
+      if (index >= 0) keys[index] = row;
+      else keys.push(row);
+    },
     touchLastUsed: async (id, iso) => {
       const row = keys.find((key) => key.id === id);
       if (row) row.lastUsedAt = iso;
@@ -115,6 +125,19 @@ function memory(now = NOW) {
       if (index >= 0) rows[index] = next;
       else rows.push(next);
       return next;
+    },
+    createOwnedRecord: async (record, owner) => {
+      const index = rows.findIndex((row) => row.token === record.token);
+      if (index >= 0) {
+        const next = mergePayRecord(rows[index], record);
+        rows[index] = next;
+        return { record: next, created: false };
+      }
+      if (countPayRecordsOwnedBy(rows, owner) >= MAX_PAYMENT_RECORDS_PER_MERCHANT) {
+        throw new ResourceLimitExceededError("Payment request limit reached for this merchant.");
+      }
+      rows.push(record);
+      return { record, created: true };
     },
     listRecords: async () => {
       lists += 1;
@@ -816,7 +839,7 @@ test("only malformed stored rows are an unknown request", async () => {
 
 test("a store failure does not leak a stack", async () => {
   const store = memory();
-  store.deps.upsertRecord = async () => {
+  store.deps.createOwnedRecord = async () => {
     throw new Error("redis password leaked\n    at writeKv");
   };
   const result = await createPaymentRequest(post(await signedBody()), store.deps);

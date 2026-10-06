@@ -6,9 +6,9 @@ import { loadMemoLedger, type LedgerEntry } from "./ledger";
 import { findSettlementProof, lookupFromRecord, payRecordIdentity, type PaidLookup, type PayIdentity } from "./payPaid";
 import { decodePayLink } from "./payRequest";
 import {
+  createPayRecord,
   getRecord,
   listByPayee,
-  listRecords,
   markCancelled,
   markPaid,
   markViewed,
@@ -27,8 +27,7 @@ import { PAYMENT_STATUS_UNAVAILABLE, reconcilePaymentRecord } from "./reconcileP
 import { resolveCancellation } from "./resolveCancellation";
 import {
   LIMIT_EXCEEDED_CODE,
-  MAX_PAYMENT_RECORDS_PER_MERCHANT,
-  countPayRecordsOwnedBy,
+  ResourceLimitExceededError,
   ownsPayRecord,
 } from "./resourceLimits";
 import { emitPaymentRequestCancelled, emitPaymentRequestCreated } from "./webhooks";
@@ -81,12 +80,15 @@ export type PayStatusDeps = {
   markPaid: (token: string, proof: PaidProof) => Promise<PayRecord | null>;
   markViewed: (token: string) => Promise<PayRecord | null>;
   upsertRecord: (record: PayRecord) => Promise<PayRecord>;
+  /**
+   * Atomic create-or-merge with per-merchant create cap on the CAS snapshot.
+   * Updating an existing token must not consume create capacity.
+   */
+  createOwnedRecord: (record: PayRecord, owner: Address) => Promise<{ record: PayRecord; created: boolean }>;
   findSettlementProof: (lookup: PaidLookup) => Promise<PaidProof | null>;
   loadMemoLedger: (account: Address) => Promise<LedgerEntry[]>;
   /** Existing authorizeHttp (API key or wallet-signed headers). Never a query/body merchant. */
   authorize: LegacyAuthorize;
-  /** Stored rows owned by this merchant, for the creation cap. */
-  countOwnedRecords: (owner: Address) => Promise<number>;
   /** Process-local limiter. True when allowed. */
   rateLimit: (routeClass: LegacyRouteClass, key: string) => boolean;
   /** Rate-limit identity for unauthenticated callers. Must not trust spoofable headers. */
@@ -256,17 +258,25 @@ async function registerInner(
     return { status: 200, body: { record: publicPayRecord(existing) } };
   }
 
-  const owned = await deps.countOwnedRecords(owner);
-  if (owned >= MAX_PAYMENT_RECORDS_PER_MERCHANT) {
-    return fail(409, "Payment request limit reached for this merchant.", LIMIT_EXCEEDED_CODE);
+  let createdRow: PayRecord;
+  let created: boolean;
+  try {
+    const result = await deps.createOwnedRecord(blankRecord(token, identity), owner);
+    createdRow = result.record;
+    created = result.created;
+  } catch (err) {
+    if (err instanceof ResourceLimitExceededError) {
+      return fail(409, err.message, LIMIT_EXCEEDED_CODE);
+    }
+    throw err;
   }
-
-  const row = await deps.upsertRecord(blankRecord(token, identity));
   // payment_request.created is delivered to the payee's endpoints (Phase 4 semantics).
   // Emit only when the authenticated/signed owner is that payee, so a third party
   // cannot trigger webhooks on another merchant by naming them as recipient.
-  if (getAddress(row.to) === owner) (deps.emitCreated ?? emitPaymentRequestCreated)(row);
-  return { status: 200, body: { record: publicPayRecord(row) } };
+  if (created && getAddress(createdRow.to) === owner) {
+    (deps.emitCreated ?? emitPaymentRequestCreated)(createdRow);
+  }
+  return { status: 200, body: { record: publicPayRecord(createdRow) } };
 }
 
 async function payPostInner(request: Request, body: PostBody, deps: PayStatusDeps): Promise<PayHttpResult> {
@@ -393,10 +403,10 @@ export const livePayStatusDeps: PayStatusDeps = {
   markPaid,
   markViewed,
   upsertRecord,
+  createOwnedRecord: createPayRecord,
   findSettlementProof,
   loadMemoLedger,
   authorize: (request, opts) => authorizeHttp(request, opts),
-  countOwnedRecords: async (owner) => countPayRecordsOwnedBy(await listRecords(), owner),
   rateLimit: (routeClass, key) => legacyRateLimiter.allow(routeClass, key),
   clientKey: (request) => requestClientKey(request),
 };

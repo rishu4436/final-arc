@@ -120,6 +120,7 @@ function box(
     rateLimitPerMinute: 1_000_000,
     listKeys: async () => keys.map((row) => ({ ...row })),
     upsertKey: async () => undefined,
+    createKey: async () => undefined,
     touchLastUsed: async () => undefined,
   };
   const emit = (input: { type: string; data?: Record<string, unknown> }) => {
@@ -134,6 +135,16 @@ function box(
       const next = mergePayRecord(blob.records[record.token], record);
       blob.records[record.token] = next;
       return next;
+    },
+    createOwnedRecord: async (record) => {
+      const existing = blob.records[record.token];
+      if (existing) {
+        const next = mergePayRecord(existing, record);
+        blob.records[record.token] = next;
+        return { record: next, created: false };
+      }
+      blob.records[record.token] = record;
+      return { record, created: true };
     },
     listRecords: async () => Object.values(blob.records),
     loadReceipt: async () => ({ error: "Transaction not found on Arc mainnet.", status: 404 }),

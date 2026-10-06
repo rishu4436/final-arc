@@ -1,7 +1,12 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
-import type { Address, Hash } from "viem";
+import { getAddress, type Address, type Hash } from "viem";
+import {
+  MAX_PAYMENT_RECORDS_PER_MERCHANT,
+  ResourceLimitExceededError,
+  countPayRecordsOwnedBy,
+} from "./resourceLimits";
 import {
   PAY_STORE_CAS_MAX_ATTEMPTS,
   PAY_STORE_CAS_SCRIPT,
@@ -20,6 +25,8 @@ export {
   PayStoreUnavailableError,
   isPayStorePersistenceError,
 } from "./payStoreCas";
+
+export { ResourceLimitExceededError, LIMIT_EXCEEDED_CODE, MAX_PAYMENT_RECORDS_PER_MERCHANT } from "./resourceLimits";
 
 export type PayRecord = {
   token: string;
@@ -549,6 +556,40 @@ export async function upsertRecord(record: PayRecord): Promise<PayRecord> {
     store.records[record.token] = saved;
   });
   return saved;
+}
+
+/**
+ * Create-or-merge a payment row with the per-merchant create cap evaluated
+ * against the latest CAS snapshot. Updating an existing token does not consume
+ * create capacity. Throws ResourceLimitExceededError when a new row would
+ * exceed MAX_PAYMENT_RECORDS_PER_MERCHANT.
+ */
+export async function createPayRecord(
+  record: PayRecord,
+  owner: Address,
+  opts?: { maxOwned?: number },
+): Promise<{ record: PayRecord; created: boolean }> {
+  const merchant = getAddress(owner);
+  const limit = opts?.maxOwned ?? MAX_PAYMENT_RECORDS_PER_MERCHANT;
+  let saved: PayRecord = record;
+  let created = false;
+  await mutatePayStoreBlob((store) => {
+    const existing = store.records[record.token];
+    if (existing) {
+      saved = mergePayRecord(existing, record);
+      store.records[record.token] = saved;
+      created = false;
+      return;
+    }
+    const owned = countPayRecordsOwnedBy(Object.values(store.records), merchant);
+    if (owned >= limit) {
+      throw new ResourceLimitExceededError("Payment request limit reached for this merchant.");
+    }
+    saved = record;
+    store.records[record.token] = record;
+    created = true;
+  });
+  return { record: saved, created };
 }
 
 export async function getRecord(token: string): Promise<PayRecord | null> {

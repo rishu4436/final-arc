@@ -118,7 +118,12 @@ function deps(options: {
     loadMemoLedger: options.ledger ?? (async () => []),
     // Phase 13: legacy merchant reads/V1 register require auth. These fixtures act as the payee.
     authorize: async () => ({ ok: true as const, merchant: MERCHANT }),
-    countOwnedRecords: async () => 0,
+    createOwnedRecord: async (record) => {
+      const existing = records.get(record.token);
+      if (existing) return { record: existing, created: false };
+      records.set(record.token, record);
+      return { record, created: true };
+    },
     rateLimit: () => true,
     clientKey: () => "ip:test",
     emitCreated: () => {},
