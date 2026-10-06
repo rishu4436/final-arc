@@ -7,4 +7,5 @@ out
 tsconfig.tsbuildinfo
 data/pay-store.json
 
-.vercel
+# Local tooling / Foundry cache (keep untracked)
+cache/

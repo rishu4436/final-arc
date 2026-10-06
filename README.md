@@ -1,17 +1,51 @@
-# Final
+# FINAL
 
-USDC payments on Arc with a protocol memo and a public receipt. Amount is a single USDC figure. Inclusion is final; the receipt matches `arc_getCertificate` to the block.
+**Verifiable USDC payment receipts on Arc.**
 
-**Live:** [final-arc-eight.vercel.app](https://final-arc-eight.vercel.app)
+A merchant creates a signed payment request. A payer settles it using Arc's Memo primitive and USDC. FINAL independently verifies the on-chain settlement against the signed request, atomically persists payment state, and exposes a public verifiable receipt.
 
-Create a payment link from the desk. The payer opens `/p/…`, signs the same Memo transfer, and lands on `/r/<tx>`. Payers on Base, Ethereum, Arbitrum, OP, Polygon, or Avalanche can burn USDC there (CCTP), mint native USDC on Arc, then settle through Memo.
+**Live:** [final-arc-eight.vercel.app](https://final-arc-eight.vercel.app)  
+**Implementation SHA:** `b5e6848` (Phase 14 — production E2E verified)
+
+---
+
+## What ships
+
+| Capability | Status |
+|---|---|
+| Signed V2 payment requests (EIP-712) | **SHIPPED** |
+| Merchant-bound recipient (`recipient === merchant`) | **SHIPPED** |
+| Arc Memo settlement binding | **SHIPPED** |
+| Exact USDC transfer verification | **SHIPPED** |
+| Deterministic reconciliation (submit / authenticated recover) | **SHIPPED** |
+| Pure payment GETs (no read-side reconcile) | **SHIPPED** |
+| Public cryptographic receipts (`/r/<tx>`) | **SHIPPED** |
+| Merchant dashboard | **SHIPPED** |
+| Developer API (`/api/v1`) + API keys | **SHIPPED** |
+| TypeScript SDK (`sdk/`, unpublished) | **SHIPPED** |
+| Durable webhook outbox + `payment.paid` enqueue | **SHIPPED** |
+| Automatic scheduled webhook retries | **INFRASTRUCTURE-LIMITED** (Hobby: no minute cron) |
+| Payment policies | **SHIPPED** |
+| Agent payment intents | **SHIPPED** |
+| Escrow (contract + API) | **PARTIAL** — contract compiled/tested, **not deployed** |
+| Analytics (merchant) | **SHIPPED** |
+| CCTP bridge into Arc USDC | **SHIPPED** (payer path) |
+
+FINAL is **not** fully decentralized: settlement verification and durable payment state use server-side infrastructure (Vercel + Redis when configured). On-chain funds move only via the payer's wallet and Arc Memo/USDC.
+
+---
+
+## 30-second flow
+
+1. Merchant connects a wallet on Arc (`5042`) and creates a V2 request (amount, memo, expiry).
+2. FINAL stores the canonical signed token and returns a checkout URL `/p/…`.
+3. Payer opens checkout, signs **one** Memo + USDC transfer for the exact amount.
+4. Checkout submits the tx hash; the server verifies Memo + USDC against the request and CAS-settles to **PAID**.
+5. Anyone can open `/r/<txHash>` for an independent public receipt (memo, settlement, certificate height/hash).
+
+---
 
 ## Arc
-
-- USDC is gas. Native (18 decimals) and ERC-20 (6 decimals) share one balance. Sends reserve gas before transfer.
-- `Memo.memo` attaches the reference without wrapping USDC. Callers must be EOAs.
-- Lookup only marks **Final** on Memo transactions. Certificate height and block hash are checked against the transaction.
-- Statement reads Memo in/out for the connected address from Arc.
 
 | | |
 |---|---|
@@ -22,99 +56,159 @@ Create a payment link from the desk. The payer opens `/p/…`, signs the same Me
 | Explorer | `https://explorer.arc.io` |
 | CCTP domain | `26` |
 
+USDC is gas on Arc. Native (18 decimals) and ERC-20 (6 decimals) share one balance. `Memo.memo` attaches the payment reference without wrapping USDC. Callers must be EOAs.
+
+---
+
 ## Develop
 
 ```bash
 npm install
-npm test
+npm test          # 596 tests
+npx tsc --noEmit
+npm run lint
+npm run build
 npm run dev
 ```
 
 USDC on Arc is required to send.
 
+Judge-oriented docs:
+
+- [`docs/JUDGE_QUICKSTART.md`](docs/JUDGE_QUICKSTART.md) — ~2 minutes
+- [`docs/SUBMISSION.md`](docs/SUBMISSION.md) — hackathon submission package
+- [`docs/PRODUCTION_VERIFICATION.md`](docs/PRODUCTION_VERIFICATION.md) — controlled production E2E evidence
+- [`sdk/README.md`](sdk/README.md) — TypeScript SDK
+- [`contracts/README.md`](contracts/README.md) — FinalEscrow (not deployed)
+
+---
+
 ## Payment store
 
-With no Redis credentials, FINAL stores payment links in `data/pay-store.json`. That file is local development persistence.
+With no Redis credentials, FINAL stores payment links in `data/pay-store.json` (local development).
 
 Production should use one complete Redis REST pair:
 
-- `KV_REST_API_URL` and `KV_REST_API_TOKEN`
-- `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`
+- `KV_REST_API_URL` + `KV_REST_API_TOKEN`, **or**
+- `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN`
 
 If both pairs are complete, the KV pair is used. A URL from one pair is never combined with a token from the other. A pair missing either value is treated as absent.
 
-`FINAL_PAY_STORE`, when set, is the JSON file path and skips Redis. Leave it unset in production when Redis is intended. Set it only to force file storage.
+`FINAL_PAY_STORE`, when set, is the JSON file path and skips Redis. Leave it unset in production when Redis is intended.
 
-Once a Redis pair is active, a failed Redis read or write does not fall back to the JSON file. Payment-status reconciliation reports that infrastructure failure instead of treating the payment as unpaid.
+Once a Redis pair is active, a failed Redis read or write does **not** fall back to the JSON file.
 
 This repository does not record whether any deployed environment has those variables set.
 
+---
+
+## Settlement model (Phase 14)
+
+Payment **reads are pure**:
+
+- `GET /api/pay?token=` — stored state only (0 Arc reconciliation RPC)
+- `GET /api/pay?to=` — list only (auth required)
+- `GET /api/statement` — ledger scan may run read-only; does not mutate payment rows
+- Dashboard / observe / analytics — no payment reconcile mutation
+
+Settlement **writes** are explicit:
+
+| Path | Who | Behavior |
+|---|---|---|
+| `POST /api/pay` `action:"submit"` | Checkout (public, rate-limited) | Persist submitted hash → verify → CAS settle + enqueue `payment.paid` |
+| `POST /api/pay` `action:"reconcile"` | Merchant (wallet or API key) | Single-row recovery; candidates first, optional hash, bounded lookback |
+
+Invariants:
+
+- One tx settles at most one row (`settlement_used` / equivalent)
+- `paidTx` is immutable after PAID
+- `(merchant, requestId)` uniqueness for new V2 rows
+- `payment.paid` enqueued exactly once on a real OPEN→PAID (or late-supersede) transition
+- CANCELLED→PAID only if mined `blockTimestamp < cancelledAtSeconds`
+
+---
+
+## Legacy `/api/pay` boundary
+
+- `GET /api/pay?to=<address>` and `GET /api/statement?address=<address>` are merchant-private (wallet auth `payments.read` or API key `payment_requests:read`). The authenticated merchant must equal the requested address; otherwise `404`.
+- `POST /api/pay` `register` stores a V2 link only after the EIP-712 merchant signature check. V1 links are unsigned; V1 registration requires payee wallet auth or API key write scope.
+- `GET /api/pay?token=` and `view` never create a record and never settle.
+- Per-link `webhookUrl` is retired. Use signed endpoints under `/api/v1/webhooks`.
+- Public routes are rate-limited per server process (in memory on Vercel).
+- Per-merchant ceilings: 10,000 payment-request rows, 25 active (200 stored) API keys, 20 webhook endpoints, 50 policies.
+
+---
 
 ## API keys (production)
 
-API-key authentication for `/api/v1` (Developer API, SDK, agent payments, and API-key access to policies, escrows, and analytics) requires a server pepper:
-
 ```bash
-FINAL_API_KEY_PEPPER=<random secret, at least 32 bytes, set as a Vercel Secret>
+FINAL_API_KEY_PEPPER=<random secret, ≥32 bytes, Vercel Secret>
 ```
 
-- Set it as an encrypted environment variable (Vercel → Project → Settings → Environment Variables, type Secret) for **Production** and **Preview**. Never commit it, never put it in `.env` files in the repository, and never send it to the browser.
-- Stored keys are `HMAC-SHA256(FINAL_API_KEY_PEPPER, secret)`. There is no unsalted SHA-256 fallback and the application never generates a pepper.
-- If the pepper is missing or blank, API-key authentication, key creation, and key rotation **fail closed** with `503 unavailable` ("API key authentication is not configured."). Wallet-signed dashboard requests are unaffected.
-- **Changing the pepper invalidates every existing API key.** Every merchant must create new keys afterwards. Rotate it only deliberately.
+- Stored keys are `HMAC-SHA256(FINAL_API_KEY_PEPPER, secret)`. No unsalted fallback; the app never generates a pepper.
+- Missing pepper → API-key auth/create/rotate fail closed (`503`). Wallet-signed dashboard requests are unaffected.
+- **Changing the pepper invalidates every existing API key.**
 
-This repository does not record whether any deployed environment has the pepper set.
+Never commit the pepper. Never put it in `.env` files in the repository. Never send it to the browser.
 
-## Legacy `/api/pay` boundary (Phase 13)
+---
 
-- `GET /api/pay?to=<address>` and `GET /api/statement?address=<address>` are merchant-private. They require the merchant's wallet authorization (action `payments.read`) or an API key with `payment_requests:read`. The authenticated merchant must equal the requested address; anything else is `404`.
-- `POST /api/pay` `register` stores a V2 link only after the existing EIP-712 merchant signature check. V1 links are unsigned, so V1 registration requires the payee's wallet authorization (`payments.register`) or an API key with `payment_requests:write`.
-- `GET /api/pay?token=` and the `view` action never create a record. `register` and `view` do not run a settlement scan. `GET /api/pay/observe` is unchanged and read-only.
-- The per-link `webhookUrl` is retired: it is not accepted, not overwritten, never fetched, and never returned. Use signed endpoints under `/api/v1/webhooks`.
-- `/api/pay`, `/api/statement`, and `/api/receipt/[hash]` are rate limited **per server process** (in memory; not shared across Vercel instances). Off Vercel, forwarded IP headers are not trusted and all callers share one bucket.
-- Per-merchant ceilings: 10,000 payment-request rows, 25 active (200 stored) API keys, 20 webhook endpoints, 50 policies. Exceeding one returns `409 limit_exceeded`.
+## Wallet authorization
 
+Dashboard wallet signatures bind `action`, `merchant`, `timestamp`, a one-time `nonce`, and a SHA-256 digest of `METHOD\npathname\nrawBody`. Nonces are consumed atomically after recovery. Concurrent reuse fails closed.
 
-## Wallet authorization (P2-01)
+---
 
-Dashboard wallet signatures bind `action`, `merchant`, `timestamp`, a one-time `nonce`, and a SHA-256 digest of `METHOD\npathname\nrawBody`. The server consumes each nonce atomically in the shared pay store after signature recovery succeeds. Captured signatures cannot authorize a different body, action, or merchant, and concurrent reuse of one nonce fails closed. Each dashboard call signs fresh (no multi-request reuse).
+## Webhooks
 
-## API-key authentication (P2-02)
+- Emittable: `payment_request.created`, `payment_request.cancelled`, `payment.paid`, escrow transition events, `webhook.test`, `policy_denied` (audit).
+- `payment.paid` is enqueued in the same CAS as settlement (deterministic `evt_paid_*`).
+- Destinations: HTTPS only; private/loopback/metadata IPs rejected; DNS checked before HTTP; redirects disabled.
+- Secrets at rest require `FINAL_WEBHOOK_ENCRYPTION_KEY` (AES-256-GCM). Missing key → create/rotate fail closed.
+- **Automatic scheduled retries** require `CRON_SECRET` and a supported Vercel Cron plan. On Hobby without minute cron, `/api/cron/webhooks` stays fail-closed (`503 cron_not_configured`). First delivery may still run via `after()` when configured; **do not claim automatic retry scheduling is active** on the current Hobby deploy.
 
-Bearer verification rate-limits by the public key prefix before listing candidates, and HMAC-compares only keys that share that prefix. Responses do not reveal whether a specific secret exists.
+---
 
-## Webhook destinations (P2-03)
+## Escrow
 
-Webhook URLs must be HTTPS without credentials. Private, loopback, link-local, ULA, multicast, and cloud-metadata IPv4/IPv6 literals are rejected. Hostname destinations are DNS-resolved immediately before HTTP and rejected if any address is blocked. Redirects are disabled. **Residual:** Node `fetch` cannot pin the TCP connection to the pre-resolved address, so a DNS-rebinding TOCTOU between lookup and connect remains possible.
+`FinalEscrow` is implemented and Foundry-tested but **not deployed**. Leave `FINAL_ESCROW_ADDRESS` unset. Open/fund/release/refund/cancel return `contract_unavailable`. See [`contracts/README.md`](contracts/README.md).
 
-## History retention (P2-04)
+---
 
-Policy denial audit rows are capped at 500 per merchant (oldest dropped on write). Agent idempotency rows are capped at 500 per merchant. Active spend reservations, payment records, escrow records, and intents are not pruned by these ceilings.
+## Security headers
 
-## Agent `agentId` (P2-07)
+Every route sends CSP (`frame-ancestors 'none'`, `object-src 'none'`, …), `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, referrer policy, Permissions-Policy, COOP, and HSTS. `script-src` keeps `'unsafe-inline'` (App Router bootstrap). `connect-src` allows `https:`/`wss:` for wallet, RPC, and bridge APIs.
 
-`agentId` on machine payment intents is an optional client-supplied label for merchant correlation and policy allowlists. It is **not** an authenticated agent principal. Possession of `agent:write` lets a caller set any label.
+---
 
-## Escrow release authorization (P2-08)
+## Known limitations (honest)
 
-On-chain `FinalEscrow.release` may be called only by the stored **recipient**, and only while `block.timestamp < expiresAt`. After expiry, only the **payer** may `refund`. The API records on-chain evidence; it does not move funds itself. No owner/admin release path exists in the contract.
+- Hobby cron inactive → automatic webhook retry scheduling not live
+- Public Arc RPC (rate / availability)
+- Off-chain cancel cannot stop an already-broadcast on-chain pay
+- V1 matcher is weaker than V2
+- Escrow contract not deployed
+- Certificate validator signatures are listed, not cryptographically verified by this client
+- Residual DNS-rebinding TOCTOU on webhook fetch (Node cannot pin TCP to pre-resolved IP)
+- Preview encryption key may be unset in non-production environments
 
-## Webhook secrets at rest (P3-06)
+---
 
-```bash
-FINAL_WEBHOOK_ENCRYPTION_KEY=<32 random bytes as 64 hex chars or base64, set as a Vercel Secret>
-```
+## Production E2E (summary)
 
-- New and rotated webhook signing secrets are stored as AES-256-GCM ciphertext (`enc:v1:…`, random 96-bit IV, GCM tag; additional data binds the value to the endpoint id and merchant). The plaintext secret is returned once on create/rotate and never stored.
-- If the key is missing or malformed, creating an endpoint and rotating a secret **fail closed** with `503 webhook_encryption_unavailable`; no plaintext secret is written.
-- Legacy endpoints that still hold a plaintext secret keep delivering unchanged. They are re-encrypted (same secret value, so merchant verification does not change) the next time the endpoint is updated while the key is configured. Rotating the secret also migrates.
-- A delivery whose stored secret cannot be decrypted (key missing or changed) sends **no** HTTP request and is recorded as retryable `webhook_secret_unavailable`.
-- **Changing the key makes existing encrypted secrets unreadable.** Rotate it only together with rotating every endpoint secret.
+Controlled real Arc payment on implementation `b5e6848`:
 
-## Security headers (P3-05)
+- **0.1 USDC** · memo `FINAL-PHASE14-E2E`
+- request `0xef794f41cd58c600ce047ec23f9019c2`
+- tx [`0x139c4b9c…a882`](https://explorer.arc.io/tx/0x139c4b9c25738714020987072888fef3fd764944a51016de2a2427463444a882)
+- PAID persisted · checkout refresh remained PAID · receipt **VERIFIED** · same-hash resubmit idempotent · exactly one wallet transaction
 
-Every route sends a Content-Security-Policy (`frame-ancestors 'none'`, `object-src 'none'`, `base-uri 'self'`, `form-action 'self'`, same-origin scripts), `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin` (`no-referrer` on `/p/*` and `/r/*`), `Permissions-Policy`, `Cross-Origin-Opener-Policy`, and HSTS. `script-src` keeps `'unsafe-inline'` because the Next.js App Router bootstrap has no nonce pipeline here; `connect-src` allows `https:`/`wss:` for wallet, chain RPC, and bridge APIs.
+Full write-up: [`docs/PRODUCTION_VERIFICATION.md`](docs/PRODUCTION_VERIFICATION.md).
 
-## Cron / webhooks scheduler
+---
 
-Automatic scheduled webhook retries require `CRON_SECRET` and a supported Vercel cron schedule. On Hobby plans without minute cron, the processor endpoint stays fail-closed (`503 cron_not_configured`) until those are configured. See P1-06.
+## License / submission
+
+Private hackathon repository. Application logic is **code-frozen** at `b5e6848` aside from documentation-only commits.
+
+Demo video: **PENDING** — handled separately by the author.
