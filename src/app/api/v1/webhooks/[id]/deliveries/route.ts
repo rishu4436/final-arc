@@ -10,6 +10,7 @@ export async function GET(request: Request, ctx: Ctx) {
   const auth = await authorizeHttp(request, {
     scope: "webhooks:read",
     walletAction: WALLET_ACTIONS.webhooksDeliveries,
+    bodyText: "",
   });
   if (!("merchant" in auth)) return NextResponse.json(auth.body, { status: auth.status });
   const result = await listWebhookDeliveries(id, auth.merchant, {

@@ -22,7 +22,8 @@ import {
   type ApiKeyRecord,
   type ApiKeyRuntime,
 } from "./apiKeys";
-import { API_SCOPES, DEFAULT_API_KEY_SCOPES, WALLET_ACTIONS, WALLET_AUTH_HEADERS, walletAuthMessage, type ApiScope } from "./apiScopes";
+import { API_SCOPES, DEFAULT_API_KEY_SCOPES, WALLET_ACTIONS, WALLET_AUTH_HEADERS, type ApiScope } from "./apiScopes";
+import { signedWalletRequest, withMemoryNonces } from "./walletAuthTest";
 import {
   API_ERROR_CODES,
   createPaymentRequest,
@@ -130,7 +131,7 @@ function memoryRuntime(seed: ApiKeyRecord[] = [], now = NOW) {
       if (row) row.lastUsedAt = iso;
     },
   };
-  return { runtime, keys, clock, touches: () => touches };
+  return { runtime: withMemoryNonces(runtime), keys, clock, touches: () => touches };
 }
 
 function bearer(secret: string): string {
@@ -145,16 +146,13 @@ function errorOf(body: unknown): { code: string; message: string } {
 }
 
 async function walletRequest(account: typeof A, action: string, url: string, body?: unknown): Promise<Request> {
-  const message = walletAuthMessage(action, account.address, NOW);
-  const signature = await account.signMessage({ message });
-  const headers = new Headers({ "content-type": "application/json" });
-  headers.set(WALLET_AUTH_HEADERS.merchant, account.address);
-  headers.set(WALLET_AUTH_HEADERS.timestamp, String(NOW));
-  headers.set(WALLET_AUTH_HEADERS.signature, signature);
-  return new Request(url, {
+  return signedWalletRequest({
+    account,
+    action,
+    url,
+    body,
+    timestamp: NOW,
     method: body === undefined ? "GET" : "POST",
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
   });
 }
 
@@ -381,7 +379,7 @@ test("secret is returned only on create and is absent from later reads", async (
 test("plaintext API secrets are not written into the store blob", async () => {
   await withFile(async (path) => {
     const live = liveApiKeyRuntime();
-    const runtime: ApiKeyRuntime = { ...live, pepper: PEPPER, nowSeconds: () => NOW };
+    const runtime: ApiKeyRuntime = withMemoryNonces({ ...live, pepper: PEPPER, nowSeconds: () => NOW });
     const request = await walletRequest(A, WALLET_ACTIONS.apiKeysCreate, "https://pay.example/api/v1/api-keys", {
       name: "blob",
       scopes: ["webhooks:read", "webhooks:write"],

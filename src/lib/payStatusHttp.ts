@@ -70,7 +70,7 @@ export type StatementHttpResult = {
 
 export type LegacyAuthorize = (
   request: Request,
-  opts: { scope: ApiScope; walletAction: WalletAction },
+  opts: { scope: ApiScope; walletAction: WalletAction; bodyText?: string },
 ) => Promise<{ ok: true; merchant: Address } | ApiErrorResult>;
 
 export type PayStatusDeps = {
@@ -186,6 +186,7 @@ async function authorizeMerchantRead(
   const auth = await deps.authorize(request, {
     scope: "payment_requests:read",
     walletAction: WALLET_ACTIONS.paymentsRead,
+    bodyText: "",
   });
   if (!("merchant" in auth)) return { ok: false, result: fromApiError(auth) };
   if (getAddress(auth.merchant) !== requested) return { ok: false, result: notFound() };
@@ -228,6 +229,7 @@ async function registerInner(
   token: string,
   identity: PayIdentity,
   deps: PayStatusDeps,
+  bodyText = "",
 ): Promise<PayHttpResult> {
   let owner: Address;
   if (identity.version === 2) {
@@ -244,6 +246,7 @@ async function registerInner(
     const auth = await deps.authorize(request, {
       scope: "payment_requests:write",
       walletAction: WALLET_ACTIONS.paymentsRegister,
+      bodyText,
     });
     if (!("merchant" in auth)) return fromApiError(auth);
     if (getAddress(auth.merchant) !== getAddress(identity.to)) {
@@ -279,7 +282,7 @@ async function registerInner(
   return { status: 200, body: { record: publicPayRecord(createdRow) } };
 }
 
-async function payPostInner(request: Request, body: PostBody, deps: PayStatusDeps): Promise<PayHttpResult> {
+async function payPostInner(request: Request, body: PostBody, deps: PayStatusDeps, bodyText = ""): Promise<PayHttpResult> {
   const token = tokenFrom(body);
   if (!token) return { status: 400, body: { error: "token required" } };
   const identity = payRecordIdentity(token);
@@ -287,7 +290,7 @@ async function payPostInner(request: Request, body: PostBody, deps: PayStatusDep
 
   const action = body.action ?? "register";
 
-  if (action === "register") return registerInner(request, token, identity, deps);
+  if (action === "register") return registerInner(request, token, identity, deps, bodyText);
 
   if (action === "view") {
     // Public. Counts a view on an EXISTING row only. Never creates a row,
@@ -344,9 +347,15 @@ export async function payGet(request: Request, deps: PayStatusDeps): Promise<Pay
 
 /** POST /api/pay. A thrown settlement or store call does not store a cancel and is not unpaid. */
 export async function payPost(request: Request, deps: PayStatusDeps): Promise<PayHttpResult> {
+  let bodyText: string;
+  try {
+    bodyText = await request.text();
+  } catch {
+    return { status: 400, body: { error: "token required" } };
+  }
   let body: PostBody;
   try {
-    const parsed = (await request.json()) as unknown;
+    const parsed = bodyText.length === 0 ? null : (JSON.parse(bodyText) as unknown);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       return { status: 400, body: { error: "token required" } };
     }
@@ -356,7 +365,7 @@ export async function payPost(request: Request, deps: PayStatusDeps): Promise<Pa
   }
   if (!deps.rateLimit("pay.write", deps.clientKey(request))) return rateLimited();
   try {
-    return await payPostInner(request, body, deps);
+    return await payPostInner(request, body, deps, bodyText);
   } catch {
     return unavailable();
   }

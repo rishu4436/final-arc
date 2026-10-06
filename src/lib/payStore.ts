@@ -79,6 +79,11 @@ export type PolicyStoreSection = {
   denials: Record<string, unknown>;
 };
 
+/** P2-01: consumed wallet-auth nonces (merchant:nonce → expiresAt unix seconds). */
+export type WalletAuthStoreSection = {
+  nonces: Record<string, number>;
+};
+
 export type StoreFile = {
   records: Record<string, PayRecord>;
   /** Merchant webhook endpoints and delivery log. Not part of PayRecord. */
@@ -91,6 +96,8 @@ export type StoreFile = {
   agents?: AgentStoreSection;
   /** Machine-payment policies, reservations, and denial audit. Not part of PayRecord. */
   policies?: PolicyStoreSection;
+  /** P2-01 wallet authorization replay protection. */
+  walletAuth?: WalletAuthStoreSection;
 };
 
 
@@ -158,6 +165,11 @@ function isStoreFile(value: unknown): value is StoreFile {
     }
     if (!policies.denials || typeof policies.denials !== "object" || Array.isArray(policies.denials)) return false;
   }
+  const walletAuth = (value as StoreFile).walletAuth;
+  if (walletAuth !== undefined) {
+    if (!walletAuth || typeof walletAuth !== "object" || Array.isArray(walletAuth)) return false;
+    if (!walletAuth.nonces || typeof walletAuth.nonces !== "object" || Array.isArray(walletAuth.nonces)) return false;
+  }
   return true;
 }
 
@@ -196,6 +208,13 @@ function preservePolicySection(current: StoreFile, outgoing: StoreFile): void {
   }
 }
 
+/** Writers that omit walletAuth must not wipe consumed nonces (P2-01). */
+function preserveWalletAuthSection(current: StoreFile, outgoing: StoreFile): void {
+  if (outgoing.walletAuth === undefined && current.walletAuth !== undefined) {
+    outgoing.walletAuth = current.walletAuth;
+  }
+}
+
 /**
  * Copy durable paid/cancelled flags from the snapshot the mutator started from.
  * With CAS retries, a concurrent paid/cancel that lands after this snapshot causes
@@ -226,6 +245,7 @@ function applySectionGuards(current: StoreFile, outgoing: StoreFile): void {
   preserveEscrowSection(current, outgoing);
   preserveAgentSection(current, outgoing);
   preservePolicySection(current, outgoing);
+  preserveWalletAuthSection(current, outgoing);
 }
 
 async function discardBody(res: Response): Promise<void> {

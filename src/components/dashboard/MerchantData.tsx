@@ -69,7 +69,10 @@ export function MerchantDataProvider({ children }: { children: ReactNode }) {
       try {
         let headers: Record<string, string>;
         try {
-          headers = await cachedWalletHeaders(WALLET_ACTIONS.paymentsRead, requested, (args) => signRef.current(args));
+          headers = await cachedWalletHeaders(WALLET_ACTIONS.paymentsRead, requested, (args) => signRef.current(args), {
+            method: "GET",
+            path: "/api/pay",
+          });
         } catch {
           if (!cancelled) {
             setError("Sign the wallet authorization to load payment requests.");

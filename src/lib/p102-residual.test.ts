@@ -15,7 +15,9 @@ import {
   liveApiKeyRuntime,
   type ApiKeyRecord,
 } from "./apiKeys";
-import { WALLET_ACTIONS, WALLET_AUTH_HEADERS, walletAuthMessage } from "./apiScopes";
+import { apiKeyPrefix } from "./apiKeys";
+import { WALLET_ACTIONS } from "./apiScopes";
+import { signedWalletRequest } from "./walletAuthTest";
 import { createFakeRedis } from "./fakeRedisRest";
 import {
   applyEscrowTransition,
@@ -137,16 +139,13 @@ function payRow(token: string, to: Address = A.address): PayRecord {
 }
 
 async function walletCreateRequest(name: string): Promise<Request> {
-  const message = walletAuthMessage(WALLET_ACTIONS.apiKeysCreate, A.address, NOW);
-  const signature = await A.signMessage({ message });
-  const headers = new Headers({ "content-type": "application/json" });
-  headers.set(WALLET_AUTH_HEADERS.merchant, A.address);
-  headers.set(WALLET_AUTH_HEADERS.timestamp, String(NOW));
-  headers.set(WALLET_AUTH_HEADERS.signature, signature);
-  return new Request("http://localhost/api/v1/api-keys", {
+  return signedWalletRequest({
+    account: A,
+    action: WALLET_ACTIONS.apiKeysCreate,
+    url: "https://pay.example/api/v1/api-keys",
     method: "POST",
-    headers,
-    body: JSON.stringify({ name }),
+    body: { name, scopes: ["webhooks:read"] },
+    timestamp: NOW,
   });
 }
 
@@ -255,7 +254,7 @@ test("4: CAS retries preserve unrelated sections during capped create", () =>
       id: "key_cas_retry",
       merchant: A.address,
       name: "cas",
-      prefix: secret.slice(0, 18),
+      prefix: apiKeyPrefix(secret),
       hash: hashApiSecret(secret, PEPPER),
       scopes: ["payments:read"],
       enabled: true,
@@ -450,7 +449,7 @@ test("secret is generated before CAS and stable across createKey retries", () =>
       id: "key_stable_secret",
       merchant: A.address,
       name: "stable",
-      prefix: secret.slice(0, 18),
+      prefix: apiKeyPrefix(secret),
       hash,
       scopes: ["payments:read"],
       enabled: true,

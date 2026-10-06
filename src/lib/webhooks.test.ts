@@ -80,6 +80,7 @@ function mockDeps(opts?: {
       secrets.push(secret);
       return secret;
     },
+    resolveHost: async () => ["93.184.216.34"],
     fetch: async (url, init) => {
       const call: FetchCall = {
         url,

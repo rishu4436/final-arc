@@ -10,6 +10,7 @@ export async function POST(request: Request, ctx: Ctx) {
   const auth = await authorizeHttp(request, {
     scope: "webhooks:write",
     walletAction: WALLET_ACTIONS.webhooksTest,
+    bodyText: "",
   });
   if (!("merchant" in auth)) return NextResponse.json(auth.body, { status: auth.status });
   const result = await sendWebhookTest(id, auth.merchant, {

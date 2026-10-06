@@ -28,7 +28,7 @@ import {
   type UnsignedPaymentRequest,
   type VerifyApiBody,
 } from "./developerApi";
-import { hashApiSecret, type ApiKeyRecord, type ApiKeyRuntime } from "./apiKeys";
+import { hashApiSecret, resetApiKeyRateLimits, type ApiKeyRecord, type ApiKeyRuntime } from "./apiKeys";
 import { API_SCOPES } from "./apiScopes";
 import { deriveMemoId, finalRequestTypedData, signFinalRequest, validateFinalRequest, type FinalRequestDraft } from "./finalRequest";
 import type { LoadedReceipt } from "./loadReceipt";
@@ -85,6 +85,7 @@ function testKey(address: string): ApiKeyRecord {
 }
 
 function memory(now = NOW) {
+  resetApiKeyRateLimits();
   const rows: PayRecord[] = [];
   let clock = now;
   let loads = 0;

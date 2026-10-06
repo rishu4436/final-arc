@@ -17,6 +17,7 @@ import {
   MAX_STORED_API_KEYS_PER_MERCHANT,
   ResourceLimitExceededError,
 } from "./resourceLimits";
+import { consumeWalletNonce, isWalletNonce, preAuthBucketKey, walletPayloadDigest } from "./walletNonce";
 
 /**
  * API keys authorize /api/v1. The secret is returned once. The store keeps
@@ -83,6 +84,8 @@ export type ApiKeyRuntime = {
    */
   createKey: (row: ApiKeyRecord) => Promise<void>;
   touchLastUsed: (id: string, iso: string) => Promise<void>;
+  /** P2-01: override nonce consumption (tests). Defaults to shared-store CAS. */
+  consumeWalletNonce?: (merchant: Address, nonce: string, nowSeconds: number) => Promise<boolean>;
 };
 
 type AuthFailure = { ok: false; status: number; code: string; message: string };
@@ -90,13 +93,29 @@ type AuthOk = { ok: true; merchant: Address; keyId: string; scopes: ApiScope[] }
 
 const rateBuckets = new Map<string, { start: number; count: number }>();
 const lastUsedWriteAt = new Map<string, number>();
+/** P2-02: bound unauthenticated bearer work before HMAC scans. Process-local. */
+const preAuthBuckets = new Map<string, { start: number; count: number }>();
+export const PRE_AUTH_RATE_LIMIT_PER_MINUTE = 60;
 
 export function resetApiKeyRateLimits(): void {
   rateBuckets.clear();
+  preAuthBuckets.clear();
 }
 
 export function resetApiKeyUseThrottle(): void {
   lastUsedWriteAt.clear();
+}
+
+function allowPreAuth(tokenPrefix: string, nowSeconds: number): boolean {
+  const slot = preAuthBucketKey(tokenPrefix);
+  const current = preAuthBuckets.get(slot);
+  if (!current || nowSeconds - current.start >= 60) {
+    preAuthBuckets.set(slot, { start: nowSeconds, count: 1 });
+    return true;
+  }
+  if (current.count >= PRE_AUTH_RATE_LIMIT_PER_MINUTE) return false;
+  current.count += 1;
+  return true;
 }
 
 export function apiError(status: number, code: string, message: string): ApiErrorResult {
@@ -225,6 +244,13 @@ export async function authenticateAuthorization(
   const pepper = pepperOrFail(runtime);
   if (typeof pepper !== "string") return pepper;
 
+  const nowSeconds = runtime.nowSeconds();
+  // P2-02: bound work before listing/HMAC. Keyed by public prefix fingerprint, not the secret.
+  const presentedPrefix = apiKeyPrefix(token);
+  if (!allowPreAuth(presentedPrefix, nowSeconds)) {
+    return failure(429, "rate_limited", "Too many requests.");
+  }
+
   let keys: ApiKeyRecord[];
   try {
     keys = await runtime.listKeys();
@@ -232,24 +258,31 @@ export async function authenticateAuthorization(
     return failure(503, "store_unavailable", "Payment store is unavailable.");
   }
 
+  // P2-02: only HMAC-compare keys that share the public prefix (typically 0–1 rows).
+  const candidates = keys.filter((key) => key.prefix === presentedPrefix);
   const presented = hashApiSecret(token, pepper);
   let matched: ApiKeyRecord | null = null;
-  for (const key of keys) {
-    if (hashesEqual(presented, key.hash)) matched = key;
+  // Always run at least one compare so empty-candidate timing is closer to a miss.
+  if (candidates.length === 0) {
+    hashesEqual(presented, "0".repeat(64));
+  } else {
+    for (const key of candidates) {
+      if (hashesEqual(presented, key.hash)) matched = key;
+    }
   }
   if (!matched || !matched.enabled || matched.revoked) return unauthorized();
   if (matched.expiresAt) {
     const exp = Date.parse(matched.expiresAt);
-    if (Number.isNaN(exp) || runtime.nowSeconds() * 1000 >= exp) return unauthorized();
+    if (Number.isNaN(exp) || nowSeconds * 1000 >= exp) return unauthorized();
   }
 
   const routeClass = routeClassForScope(scope);
   const limit = runtime.rateLimitPerMinute ?? API_KEY_RATE_LIMIT_PER_MINUTE;
-  if (!checkRateLimit(matched.id, routeClass, runtime.nowSeconds(), limit)) {
+  if (!checkRateLimit(matched.id, routeClass, nowSeconds, limit)) {
     return failure(429, "rate_limited", "Too many requests.");
   }
 
-  await noteLastUsed(runtime, matched.id, runtime.nowSeconds());
+  await noteLastUsed(runtime, matched.id, nowSeconds);
 
   if (!matched.scopes.includes(scope)) {
     return failure(403, "forbidden", "Missing required scope.");
@@ -259,15 +292,30 @@ export async function authenticateAuthorization(
   return { ok: true, merchant: getAddress(matched.merchant), keyId: matched.id, scopes: matched.scopes };
 }
 
+export type WalletAuthBindingOpts = {
+  /** Exact raw body string (or "" when none). Digested with method+path for P2-01. */
+  bodyText?: string;
+  /** Pathname override; defaults to the request URL pathname. */
+  resourcePath?: string;
+  /** Override nonce consumer (tests / injected runtime). */
+  consumeNonce?: (merchant: Address, nonce: string, nowSeconds: number) => Promise<boolean>;
+};
+
+/**
+ * Recover the signing merchant and consume the one-time nonce (P2-01).
+ * Signature verification runs before nonce consumption. A replayed nonce fails closed.
+ */
 export async function recoverWalletMerchant(
   request: Request,
   action: WalletAction,
   nowSeconds: number,
+  binding: WalletAuthBindingOpts = {},
 ): Promise<{ ok: true; merchant: Address } | AuthFailure> {
   const merchantRaw = request.headers.get(WALLET_AUTH_HEADERS.merchant);
   const timestampRaw = request.headers.get(WALLET_AUTH_HEADERS.timestamp);
   const signature = request.headers.get(WALLET_AUTH_HEADERS.signature);
-  if (!merchantRaw || !timestampRaw || !signature) return unauthorized();
+  const nonceRaw = request.headers.get(WALLET_AUTH_HEADERS.nonce);
+  if (!merchantRaw || !timestampRaw || !signature || !nonceRaw) return unauthorized();
   if (!isAddress(merchantRaw)) return unauthorized();
   const merchant = getAddress(merchantRaw);
   if (!/^[0-9]+$/.test(timestampRaw)) return unauthorized();
@@ -275,19 +323,49 @@ export async function recoverWalletMerchant(
   if (!Number.isSafeInteger(timestamp)) return unauthorized();
   if (Math.abs(nowSeconds - timestamp) > WALLET_AUTH_TOLERANCE_SECONDS) return unauthorized();
   if (!isHex(signature, { strict: true })) return unauthorized();
-  const message = walletAuthMessage(action, merchant, timestamp);
+  if (!isWalletNonce(nonceRaw)) return unauthorized();
+
+  let pathname = binding.resourcePath;
+  if (!pathname) {
+    try {
+      pathname = new URL(request.url).pathname;
+    } catch {
+      return unauthorized();
+    }
+  }
+  const bodyText = binding.bodyText ?? "";
+  const digest = walletPayloadDigest(request.method, pathname, bodyText);
+  const message = walletAuthMessage(action, merchant, timestamp, nonceRaw.toLowerCase(), digest);
   try {
     const signer = await recoverMessageAddress({ message, signature: signature as Hex });
     if (getAddress(signer) !== merchant) return unauthorized();
   } catch {
     return unauthorized();
   }
+
+  // Consume only after cryptographic checks succeed.
+  const consume = binding.consumeNonce ?? consumeWalletNonce;
+  let consumed = false;
+  try {
+    consumed = await consume(merchant, nonceRaw, nowSeconds);
+  } catch {
+    return failure(503, "store_unavailable", "Payment store is unavailable.");
+  }
+  if (!consumed) {
+    return failure(401, "unauthorized", AUTH_MESSAGE);
+  }
   return { ok: true, merchant };
 }
 
 export async function authorizeHttp(
   request: Request,
-  opts: { scope: ApiScope; walletAction?: WalletAction; allowBearer?: boolean },
+  opts: {
+    scope: ApiScope;
+    walletAction?: WalletAction;
+    allowBearer?: boolean;
+    bodyText?: string;
+    resourcePath?: string;
+  },
   runtime: ApiKeyRuntime = liveApiKeyRuntime(),
 ): Promise<{ ok: true; merchant: Address } | ApiErrorResult> {
   const allowBearer = opts.allowBearer !== false;
@@ -298,11 +376,37 @@ export async function authorizeHttp(
     return { ok: true, merchant: auth.merchant };
   }
   if (opts.walletAction) {
-    const wallet = await recoverWalletMerchant(request, opts.walletAction, runtime.nowSeconds());
+    const wallet = await recoverWalletMerchant(request, opts.walletAction, runtime.nowSeconds(), {
+      bodyText: opts.bodyText,
+      resourcePath: opts.resourcePath,
+      consumeNonce: runtime.consumeWalletNonce,
+    });
     if (!wallet.ok) return apiError(wallet.status, wallet.code, wallet.message);
     return { ok: true, merchant: wallet.merchant };
   }
   return apiError(401, "unauthorized", AUTH_MESSAGE);
+}
+
+/** Read the raw body once so wallet payload binding and JSON parsing share the same bytes. */
+export async function readRequestBodyText(request: Request): Promise<string> {
+  try {
+    return await request.text();
+  } catch {
+    return "";
+  }
+}
+
+export function parseJsonObject(raw: string): Record<string, unknown> | ApiErrorResult {
+  let parsed: unknown;
+  try {
+    parsed = raw.length === 0 ? null : JSON.parse(raw);
+  } catch {
+    return apiError(400, "invalid_json", "Request body must be JSON.");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return apiError(400, "invalid_json", "Request body must be a JSON object.");
+  }
+  return parsed as Record<string, unknown>;
 }
 
 function ensureSection(store: { apiKeys?: ApiKeyStoreSection }): ApiKeyStoreSection {
@@ -379,18 +483,6 @@ function parseName(value: unknown): string | ApiErrorResult {
   return name;
 }
 
-async function readJson(request: Request): Promise<Record<string, unknown> | ApiErrorResult> {
-  let parsed: unknown;
-  try {
-    parsed = await request.json();
-  } catch {
-    return apiError(400, "invalid_json", "Request body must be JSON.");
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return apiError(400, "invalid_json", "Request body must be a JSON object.");
-  }
-  return parsed as Record<string, unknown>;
-}
 
 function isApiError(value: unknown): value is ApiErrorResult {
   return !!value && typeof value === "object" && "status" in value && "body" in value;
@@ -400,8 +492,12 @@ async function walletMerchant(
   request: Request,
   action: WalletAction,
   runtime: ApiKeyRuntime,
+  binding: WalletAuthBindingOpts = {},
 ): Promise<{ ok: true; merchant: Address } | { ok: false; error: ApiErrorResult }> {
-  const wallet = await recoverWalletMerchant(request, action, runtime.nowSeconds());
+  const wallet = await recoverWalletMerchant(request, action, runtime.nowSeconds(), {
+    ...binding,
+    consumeNonce: binding.consumeNonce ?? runtime.consumeWalletNonce,
+  });
   if (!wallet.ok) return { ok: false, error: apiError(wallet.status, wallet.code, wallet.message) };
   return { ok: true, merchant: wallet.merchant };
 }
@@ -425,9 +521,10 @@ function owned(row: ApiKeyRecord | null, merchant: Address): ApiKeyRecord | null
 }
 
 export async function handleCreateApiKey(request: Request, runtime: ApiKeyRuntime = liveApiKeyRuntime()): Promise<ApiErrorResult | { status: number; body: ApiKeyCreated }> {
-  const auth = await walletMerchant(request, "api_keys.create", runtime);
+  const bodyText = await readRequestBodyText(request);
+  const auth = await walletMerchant(request, "api_keys.create", runtime, { bodyText });
   if (!auth.ok) return auth.error;
-  const body = await readJson(request);
+  const body = parseJsonObject(bodyText);
   if (isApiError(body)) return body;
   const claimed = claimedMerchant(body.merchant, auth.merchant);
   if (isApiError(claimed)) return claimed;
@@ -482,7 +579,8 @@ export async function handleListApiKeys(
   request: Request,
   runtime: ApiKeyRuntime = liveApiKeyRuntime(),
 ): Promise<ApiErrorResult | { status: number; body: { keys: ApiKeyPublic[] } }> {
-  const auth = await walletMerchant(request, "api_keys.list", runtime);
+  const bodyText = await readRequestBodyText(request);
+  const auth = await walletMerchant(request, "api_keys.list", runtime, { bodyText });
   if (!auth.ok) return auth.error;
   let keys: ApiKeyRecord[];
   try {
@@ -502,7 +600,8 @@ export async function handleGetApiKey(
   id: string,
   runtime: ApiKeyRuntime = liveApiKeyRuntime(),
 ): Promise<ApiErrorResult | { status: number; body: ApiKeyPublic }> {
-  const auth = await walletMerchant(request, "api_keys.get", runtime);
+  const bodyText = await readRequestBodyText(request);
+  const auth = await walletMerchant(request, "api_keys.get", runtime, { bodyText });
   if (!auth.ok) return auth.error;
   let keys: ApiKeyRecord[];
   try {
@@ -520,9 +619,10 @@ export async function handleUpdateApiKey(
   id: string,
   runtime: ApiKeyRuntime = liveApiKeyRuntime(),
 ): Promise<ApiErrorResult | { status: number; body: ApiKeyPublic }> {
-  const auth = await walletMerchant(request, "api_keys.update", runtime);
+  const bodyText = await readRequestBodyText(request);
+  const auth = await walletMerchant(request, "api_keys.update", runtime, { bodyText });
   if (!auth.ok) return auth.error;
-  const body = await readJson(request);
+  const body = parseJsonObject(bodyText);
   if (isApiError(body)) return body;
   const claimed = claimedMerchant(body.merchant, auth.merchant);
   if (isApiError(claimed)) return claimed;
@@ -565,7 +665,8 @@ export async function handleDeleteApiKey(
   id: string,
   runtime: ApiKeyRuntime = liveApiKeyRuntime(),
 ): Promise<ApiErrorResult | { status: number; body: { revoked: true; id: string } }> {
-  const auth = await walletMerchant(request, "api_keys.delete", runtime);
+  const bodyText = await readRequestBodyText(request);
+  const auth = await walletMerchant(request, "api_keys.delete", runtime, { bodyText });
   if (!auth.ok) return auth.error;
   let keys: ApiKeyRecord[];
   try {
@@ -589,7 +690,8 @@ export async function handleRotateApiKey(
   id: string,
   runtime: ApiKeyRuntime = liveApiKeyRuntime(),
 ): Promise<ApiErrorResult | { status: number; body: ApiKeyCreated }> {
-  const auth = await walletMerchant(request, "api_keys.rotate", runtime);
+  const bodyText = await readRequestBodyText(request);
+  const auth = await walletMerchant(request, "api_keys.rotate", runtime, { bodyText });
   if (!auth.ok) return auth.error;
   const pepper = pepperOrFail(runtime);
   if (typeof pepper !== "string") return apiError(pepper.status, pepper.code, pepper.message);

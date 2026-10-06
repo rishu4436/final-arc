@@ -20,7 +20,7 @@ import {
   type VerifiedSpend,
 } from "./paymentPolicy";
 import type { IntentFact, LedgerReservation, VerifiedSpendFact } from "./policyLedger";
-import { LIMIT_EXCEEDED_CODE, MAX_POLICIES_PER_MERCHANT } from "./resourceLimits";
+import { LIMIT_EXCEEDED_CODE, MAX_POLICIES_PER_MERCHANT, MAX_POLICY_DENIALS_PER_MERCHANT } from "./resourceLimits";
 import { safeEmitWebhookEvent } from "./webhooks";
 import type { EmittableWebhookEvent } from "./webhooksCatalog";
 
@@ -399,7 +399,31 @@ export function decideMachinePolicy(store: StoreFile, input: MachinePolicyInput)
 }
 
 export function putDenial(store: StoreFile, denial: PolicyDenialRecord): void {
-  ensurePolicySection(store).denials[denial.id] = denial;
+  const section = ensurePolicySection(store);
+  section.denials[denial.id] = denial;
+  pruneMerchantDenials(section.denials, denial.merchant);
+}
+
+/** Keep the newest denials per merchant; drop oldest by evaluatedAt/created ordering. */
+function pruneMerchantDenials(denials: Record<string, unknown>, merchant: string): void {
+  const needle = merchant.toLowerCase();
+  const mine: { id: string; at: number }[] = [];
+  for (const [id, value] of Object.entries(denials)) {
+    if (!value || typeof value !== "object") continue;
+    const row = value as { merchant?: string; evaluatedAt?: number; createdAt?: number };
+    if (typeof row.merchant !== "string" || row.merchant.toLowerCase() !== needle) continue;
+    const at =
+      typeof row.evaluatedAt === "number"
+        ? row.evaluatedAt
+        : typeof row.createdAt === "number"
+          ? row.createdAt
+          : 0;
+    mine.push({ id, at });
+  }
+  if (mine.length <= MAX_POLICY_DENIALS_PER_MERCHANT) return;
+  mine.sort((a, b) => a.at - b.at);
+  const drop = mine.length - MAX_POLICY_DENIALS_PER_MERCHANT;
+  for (let i = 0; i < drop; i += 1) delete denials[mine[i].id];
 }
 
 export function putReservation(store: StoreFile, reservation: SpendReservation): void {
@@ -470,26 +494,15 @@ async function authorize(
   scope: ApiScope,
   action: WalletAction,
   deps: PolicyDeps,
+  bodyText = "",
 ): Promise<{ ok: true; merchant: Address } | PolicyResult> {
   const smuggled = rejectSmuggled(request);
   if (smuggled) return smuggled;
-  const auth = await authorizeHttp(request, { scope, walletAction: action }, deps.apiKeyAuth);
+  const auth = await authorizeHttp(request, { scope, walletAction: action, bodyText }, deps.apiKeyAuth);
   if (!("merchant" in auth)) return auth;
   return { ok: true, merchant: auth.merchant };
 }
 
-async function readJson(request: Request): Promise<Record<string, unknown> | PolicyResult> {
-  let parsed: unknown;
-  try {
-    parsed = await request.json();
-  } catch {
-    return error(400, "invalid_json", "Request body must be JSON.");
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return error(400, "invalid_json", "Request body must be a JSON object.");
-  }
-  return parsed as Record<string, unknown>;
-}
 
 function isResult(value: unknown): value is PolicyResult {
   return !!value && typeof value === "object" && "status" in value && "body" in value;
@@ -522,9 +535,18 @@ function publicPolicy(policy: PaymentPolicy): PaymentPolicy {
 }
 
 export async function createPolicy(request: Request, deps: PolicyDeps): Promise<PolicyResult> {
-  const auth = await authorize(request, "policies:write", WALLET_ACTIONS.policiesCreate, deps);
+  const raw = await request.text().catch(() => "");
+  const auth = await authorize(request, "policies:write", WALLET_ACTIONS.policiesCreate, deps, raw);
   if (!("ok" in auth)) return auth;
-  const body = await readJson(request);
+  let body: Record<string, unknown> | PolicyResult;
+  try {
+    const parsed = raw.length === 0 ? null : JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      body = error(400, "invalid_json", "Request body must be a JSON object.");
+    } else body = parsed as Record<string, unknown>;
+  } catch {
+    body = error(400, "invalid_json", "Request body must be JSON.");
+  }
   if (isResult(body)) return body;
   const smuggled = rejectSmuggled(request, body);
   if (smuggled) return smuggled;
@@ -572,7 +594,7 @@ export async function createPolicy(request: Request, deps: PolicyDeps): Promise<
 }
 
 export async function listPolicies(request: Request, deps: PolicyDeps): Promise<PolicyResult> {
-  const auth = await authorize(request, "policies:read", WALLET_ACTIONS.policiesList, deps);
+  const auth = await authorize(request, "policies:read", WALLET_ACTIONS.policiesList, deps, "");
   if (!("ok" in auth)) return auth;
   try {
     const store = await deps.readBlob();
@@ -586,7 +608,7 @@ export async function listPolicies(request: Request, deps: PolicyDeps): Promise<
 }
 
 export async function getPolicy(request: Request, id: string, deps: PolicyDeps): Promise<PolicyResult> {
-  const auth = await authorize(request, "policies:read", WALLET_ACTIONS.policiesGet, deps);
+  const auth = await authorize(request, "policies:read", WALLET_ACTIONS.policiesGet, deps, "");
   if (!("ok" in auth)) return auth;
   try {
     const store = await deps.readBlob();
@@ -599,9 +621,18 @@ export async function getPolicy(request: Request, id: string, deps: PolicyDeps):
 }
 
 export async function updatePolicy(request: Request, id: string, deps: PolicyDeps): Promise<PolicyResult> {
-  const auth = await authorize(request, "policies:write", WALLET_ACTIONS.policiesUpdate, deps);
+  const raw = await request.text().catch(() => "");
+  const auth = await authorize(request, "policies:write", WALLET_ACTIONS.policiesUpdate, deps, raw);
   if (!("ok" in auth)) return auth;
-  const body = await readJson(request);
+  let body: Record<string, unknown> | PolicyResult;
+  try {
+    const parsed = raw.length === 0 ? null : JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      body = error(400, "invalid_json", "Request body must be a JSON object.");
+    } else body = parsed as Record<string, unknown>;
+  } catch {
+    body = error(400, "invalid_json", "Request body must be JSON.");
+  }
   if (isResult(body)) return body;
   const smuggled = rejectSmuggled(request, body);
   if (smuggled) return smuggled;
@@ -665,7 +696,7 @@ export async function updatePolicy(request: Request, id: string, deps: PolicyDep
 }
 
 export async function deletePolicy(request: Request, id: string, deps: PolicyDeps): Promise<PolicyResult> {
-  const auth = await authorize(request, "policies:write", WALLET_ACTIONS.policiesDelete, deps);
+  const auth = await authorize(request, "policies:write", WALLET_ACTIONS.policiesDelete, deps, "");
   if (!("ok" in auth)) return auth;
   try {
     const failure = await withMerchantPolicyLock(auth.merchant, async () => {

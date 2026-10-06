@@ -73,3 +73,32 @@ This repository does not record whether any deployed environment has the pepper 
 - The per-link `webhookUrl` is retired: it is not accepted, not overwritten, never fetched, and never returned. Use signed endpoints under `/api/v1/webhooks`.
 - `/api/pay`, `/api/statement`, and `/api/receipt/[hash]` are rate limited **per server process** (in memory; not shared across Vercel instances). Off Vercel, forwarded IP headers are not trusted and all callers share one bucket.
 - Per-merchant ceilings: 10,000 payment-request rows, 25 active (200 stored) API keys, 20 webhook endpoints, 50 policies. Exceeding one returns `409 limit_exceeded`.
+
+
+## Wallet authorization (P2-01)
+
+Dashboard wallet signatures bind `action`, `merchant`, `timestamp`, a one-time `nonce`, and a SHA-256 digest of `METHOD\npathname\nrawBody`. The server consumes each nonce atomically in the shared pay store after signature recovery succeeds. Captured signatures cannot authorize a different body, action, or merchant, and concurrent reuse of one nonce fails closed. Each dashboard call signs fresh (no multi-request reuse).
+
+## API-key authentication (P2-02)
+
+Bearer verification rate-limits by the public key prefix before listing candidates, and HMAC-compares only keys that share that prefix. Responses do not reveal whether a specific secret exists.
+
+## Webhook destinations (P2-03)
+
+Webhook URLs must be HTTPS without credentials. Private, loopback, link-local, ULA, multicast, and cloud-metadata IPv4/IPv6 literals are rejected. Hostname destinations are DNS-resolved immediately before HTTP and rejected if any address is blocked. Redirects are disabled. **Residual:** Node `fetch` cannot pin the TCP connection to the pre-resolved address, so a DNS-rebinding TOCTOU between lookup and connect remains possible.
+
+## History retention (P2-04)
+
+Policy denial audit rows are capped at 500 per merchant (oldest dropped on write). Agent idempotency rows are capped at 500 per merchant. Active spend reservations, payment records, escrow records, and intents are not pruned by these ceilings.
+
+## Agent `agentId` (P2-07)
+
+`agentId` on machine payment intents is an optional client-supplied label for merchant correlation and policy allowlists. It is **not** an authenticated agent principal. Possession of `agent:write` lets a caller set any label.
+
+## Escrow release authorization (P2-08)
+
+On-chain `FinalEscrow.release` may be called only by the stored **recipient**, and only while `block.timestamp < expiresAt`. After expiry, only the **payer** may `refund`. The API records on-chain evidence; it does not move funds itself. No owner/admin release path exists in the contract.
+
+## Cron / webhooks scheduler
+
+Automatic scheduled webhook retries require `CRON_SECRET` and a supported Vercel cron schedule. On Hobby plans without minute cron, the processor endpoint stays fail-closed (`503 cron_not_configured`) until those are configured. See P1-06.

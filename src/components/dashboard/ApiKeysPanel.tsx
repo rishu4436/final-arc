@@ -49,9 +49,12 @@ export function ApiKeysPanel() {
   const merchant = address ?? null;
 
   const authHeaders = useCallback(
-    async (action: (typeof WALLET_ACTIONS)[keyof typeof WALLET_ACTIONS]) => {
+    async (
+      action: (typeof WALLET_ACTIONS)[keyof typeof WALLET_ACTIONS],
+      binding: { method: string; path: string; body?: string },
+    ) => {
       if (!merchant) throw new Error("Wallet is not connected.");
-      return signedWalletHeaders(action, merchant, (args) => signMessageAsync(args));
+      return signedWalletHeaders(action, merchant, (args) => signMessageAsync(args), binding);
     },
     [merchant, signMessageAsync],
   );
@@ -61,7 +64,7 @@ export function ApiKeysPanel() {
     setLoading(true);
     setError(null);
     try {
-      const headers = await authHeaders(WALLET_ACTIONS.apiKeysList);
+      const headers = await authHeaders(WALLET_ACTIONS.apiKeysList, { method: "GET", path: "/api/v1/api-keys" });
       const res = await fetch("/api/v1/api-keys", { headers });
       const body = await res.json();
       if (!res.ok) {
@@ -91,11 +94,16 @@ export function ApiKeysPanel() {
     setBusy(true);
     setError(null);
     try {
-      const headers = await authHeaders(WALLET_ACTIONS.apiKeysCreate);
+      const bodyText = JSON.stringify({ name: name.trim(), scopes });
+      const headers = await authHeaders(WALLET_ACTIONS.apiKeysCreate, {
+        method: "POST",
+        path: "/api/v1/api-keys",
+        body: bodyText,
+      });
       const res = await fetch("/api/v1/api-keys", {
         method: "POST",
         headers: { ...headers, "content-type": "application/json" },
-        body: JSON.stringify({ name: name.trim(), scopes }),
+        body: bodyText,
       });
       const body = await res.json();
       if (!res.ok) {
@@ -119,8 +127,9 @@ export function ApiKeysPanel() {
     setBusy(true);
     setError(null);
     try {
-      const headers = await authHeaders(WALLET_ACTIONS.apiKeysDelete);
-      const res = await fetch(`/api/v1/api-keys/${encodeURIComponent(id)}`, { method: "DELETE", headers });
+      const path = `/api/v1/api-keys/${encodeURIComponent(id)}`;
+      const headers = await authHeaders(WALLET_ACTIONS.apiKeysDelete, { method: "DELETE", path });
+      const res = await fetch(path, { method: "DELETE", headers });
       const body = await res.json();
       if (!res.ok) {
         setError(errorMessage(body));
@@ -139,7 +148,8 @@ export function ApiKeysPanel() {
     setBusy(true);
     setError(null);
     try {
-      const headers = await authHeaders(WALLET_ACTIONS.apiKeysRotate);
+      const path = `/api/v1/api-keys/${encodeURIComponent(id)}/rotate`;
+      const headers = await authHeaders(WALLET_ACTIONS.apiKeysRotate, { method: "POST", path, body: "" });
       const res = await fetch(`/api/v1/api-keys/${encodeURIComponent(id)}/rotate`, {
         method: "POST",
         headers,

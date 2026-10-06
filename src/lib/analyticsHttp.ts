@@ -115,7 +115,7 @@ function rangeOut(range: AnalyticsRange) {
 async function authorize(request: Request, deps: AnalyticsDeps): Promise<Address | AnalyticsResult> {
   const auth = await authorizeHttp(
     request,
-    { scope: "analytics:read", walletAction: WALLET_ACTIONS.analyticsRead },
+    { scope: "analytics:read", walletAction: WALLET_ACTIONS.analyticsRead, bodyText: "" },
     deps.apiKeyAuth,
   );
   if (!("merchant" in auth)) return { status: auth.status, body: auth.body };

@@ -86,7 +86,10 @@ export function EscrowList() {
     setBusy(true);
     setError(null);
     try {
-      const headers = await signedWalletHeaders(WALLET_ACTIONS.escrowsList, address as Address, signMessageAsync);
+      const headers = await signedWalletHeaders(WALLET_ACTIONS.escrowsList, address as Address, signMessageAsync, {
+        method: "GET",
+        path: "/api/v1/escrows",
+      });
       const res = await fetch("/api/v1/escrows", { headers });
       const body = (await res.json()) as { escrows?: EscrowJson[] };
       if (!res.ok) {
@@ -173,7 +176,10 @@ export function EscrowDetail({ escrowId }: { escrowId: string }) {
     setBusy(true);
     setError(null);
     try {
-      const headers = await signedWalletHeaders(WALLET_ACTIONS.escrowsGet, wallet, signMessageAsync);
+      const headers = await signedWalletHeaders(WALLET_ACTIONS.escrowsGet, wallet, signMessageAsync, {
+        method: "GET",
+        path: `/api/v1/escrows/${escrowId}`,
+      });
       const res = await fetch(`/api/v1/escrows/${escrowId}`, { headers });
       const body = (await res.json()) as { escrow?: EscrowJson };
       if (!res.ok || !body.escrow) {
@@ -192,11 +198,16 @@ export function EscrowDetail({ escrowId }: { escrowId: string }) {
 
   async function post(path: string, action: WalletAction, payload: Record<string, unknown>) {
     if (!wallet) throw new Error("Wallet is not connected.");
-    const headers = await signedWalletHeaders(action, wallet, signMessageAsync);
+    const bodyText = JSON.stringify(payload);
+    const headers = await signedWalletHeaders(action, wallet, signMessageAsync, {
+      method: "POST",
+      path,
+      body: bodyText,
+    });
     const res = await fetch(path, {
       method: "POST",
       headers: { ...headers, "content-type": "application/json" },
-      body: JSON.stringify(payload),
+      body: bodyText,
     });
     const body = (await res.json()) as { escrow?: EscrowJson; error?: { message?: string } };
     return { res, body };

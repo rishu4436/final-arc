@@ -23,7 +23,8 @@ import {
   type ApiKeyRecord,
   type ApiKeyRuntime,
 } from "./apiKeys";
-import { WALLET_ACTIONS, WALLET_AUTH_HEADERS, walletAuthMessage, type ApiScope } from "./apiScopes";
+import { WALLET_ACTIONS, WALLET_AUTH_HEADERS, type ApiScope } from "./apiScopes";
+import { signedWalletRequest, withMemoryNonces } from "./walletAuthTest";
 import { ARC_CHAIN_ID } from "./arc";
 import { observeCheckoutRecord } from "./checkoutObserve";
 import { signFinalRequest, validateFinalRequest, type FinalRequest } from "./finalRequest";
@@ -44,7 +45,7 @@ import {
   ownsPayRecord,
   payRecordOwner,
 } from "./resourceLimits";
-import { cachedWalletHeaders, WALLET_SIGNATURE_REUSE_MS } from "./walletAuthCache";
+import { cachedWalletHeaders } from "./walletAuthCache";
 import {
   createWebhookEndpoint,
   defaultWebhookDeps,
@@ -183,16 +184,51 @@ function keyRuntime(keys: ApiKeyRecord[] = [], pepper: string | null = PEPPER) {
     },
     touchLastUsed: async () => {},
   };
-  return { runtime, rows, upserts: () => upserts };
+  return { runtime: withMemoryNonces(runtime), rows, upserts: () => upserts };
 }
 
-async function walletHeaders(account: typeof A, action: string, timestamp = NOW): Promise<Record<string, string>> {
-  const signature = await account.signMessage({ message: walletAuthMessage(action, account.address, timestamp) });
-  return {
-    [WALLET_AUTH_HEADERS.merchant]: account.address,
-    [WALLET_AUTH_HEADERS.timestamp]: String(timestamp),
-    [WALLET_AUTH_HEADERS.signature]: signature,
-  };
+async function walletHeaders(
+  account: typeof A,
+  action: string,
+  timestamp = NOW,
+  url = "http://localhost/api/pay",
+  method = "GET",
+  body?: unknown,
+): Promise<Record<string, string>> {
+  const req = await signedWalletRequest({ account, action, url, method, body, timestamp });
+  const headers: Record<string, string> = {};
+  req.headers.forEach((value, key) => {
+    headers[key] = value;
+  });
+  return headers;
+}
+
+async function signedPostPay(account: typeof A, body: Record<string, unknown>, timestamp = NOW) {
+  const headers = await walletHeaders(
+    account,
+    WALLET_ACTIONS.paymentsRegister,
+    timestamp,
+    "http://localhost/api/pay",
+    "POST",
+    body,
+  );
+  return post(body, headers);
+}
+
+async function signedCreateKey(account: typeof A, body: Record<string, unknown>) {
+  const headers = await walletHeaders(
+    account,
+    WALLET_ACTIONS.apiKeysCreate,
+    NOW,
+    "http://localhost/api/v1/api-keys",
+    "POST",
+    body,
+  );
+  return new Request("http://localhost/api/v1/api-keys", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify(body),
+  });
 }
 
 function memoryDeps(seed: PayRecord[] = [], opts: { keys?: ApiKeyRecord[]; limiter?: PayStatusDeps["rateLimit"] } = {}) {
@@ -316,19 +352,19 @@ test("P1-01: missing pepper fails closed for auth, create, and rotate, and store
     assert.equal(auth.status, 503);
     assert.equal(auth.code, "unavailable");
   }
-  const create = await handleCreateApiKey(
-    new Request("http://localhost/api/v1/api-keys", {
-      method: "POST",
-      headers: { "content-type": "application/json", ...(await walletHeaders(A, WALLET_ACTIONS.apiKeysCreate)) },
-      body: JSON.stringify({ name: "desk" }),
-    }),
-    box.runtime,
-  );
+  const create = await handleCreateApiKey(await signedCreateKey(A, { name: "desk" }), box.runtime);
   assert.equal(create.status, 503);
   const rotate = await handleRotateApiKey(
     new Request(`http://localhost/api/v1/api-keys/${record.id}/rotate`, {
       method: "POST",
-      headers: await walletHeaders(A, WALLET_ACTIONS.apiKeysRotate),
+      headers: await walletHeaders(
+        A,
+        WALLET_ACTIONS.apiKeysRotate,
+        NOW,
+        `http://localhost/api/v1/api-keys/${record.id}/rotate`,
+        "POST",
+        "",
+      ),
     }),
     record.id,
     box.runtime,
@@ -434,7 +470,7 @@ test("P1-03 #6: valid V2 registration still works, is idempotent, and emits crea
 test("P1-03 #6b: V1 registration works with the payee's wallet authorization or a payment_requests:write key", async () => {
   const box = memoryDeps([], { keys: [issueKey(A.address, ["payment_requests:write"]).record] });
   const token = v1Token(A.address);
-  const ok = await payPost(post({ token, action: "register" }, await walletHeaders(A, WALLET_ACTIONS.paymentsRegister)), box.deps);
+  const ok = await payPost(await signedPostPay(A, { token, action: "register" }), box.deps);
   assert.equal(ok.status, 200);
   assert.equal(box.records.size, 1);
   assert.equal(box.emitted.length, 1);
@@ -479,11 +515,15 @@ test("P1-03 #7/#8: V1 and V2 public observation still work and never create a re
 test("P1-03 #9: cross-merchant registration fails and wrong wallet action is rejected", async () => {
   const token = v1Token(A.address);
   const box = memoryDeps();
-  const crossed = await payPost(post({ token }, await walletHeaders(B, WALLET_ACTIONS.paymentsRegister)), box.deps);
+  const crossed = await payPost(await signedPostPay(B, { token, action: "register" }), box.deps);
   assert.equal(crossed.status, 403);
-  const wrongAction = await payPost(post({ token }, await walletHeaders(A, WALLET_ACTIONS.paymentsRead)), box.deps);
+  const wrongAction = await payPost(await signedPostPay(A, { token, action: "register" }).then(async () => {
+    const body = { token, action: "register" as const };
+    const headers = await walletHeaders(A, WALLET_ACTIONS.paymentsRead, NOW, "http://localhost/api/pay", "POST", body);
+    return post(body, headers);
+  }), box.deps);
   assert.equal(wrongAction.status, 401);
-  const stale = await payPost(post({ token }, await walletHeaders(A, WALLET_ACTIONS.paymentsRegister, NOW - 3600)), box.deps);
+  const stale = await payPost(await signedPostPay(A, { token, action: "register" }, NOW - 3600), box.deps);
   assert.equal(stale.status, 401);
   // A body "merchant"/"address" field cannot stand in for authentication.
   const bodyClaim = await payPost(post({ token, merchant: A.address, address: A.address }), box.deps);
@@ -538,17 +578,8 @@ test("P1-03: API key, webhook endpoint, and policy creation caps return 409 limi
     issueKey(A.address, ["payment_requests:read"], { id: `key_cap_${i}` }).record,
   );
   const keys = keyRuntime(seeded);
-  const create = () =>
-    walletHeaders(A, WALLET_ACTIONS.apiKeysCreate).then((headers) =>
-      handleCreateApiKey(
-        new Request("http://localhost/api/v1/api-keys", {
-          method: "POST",
-          headers: { "content-type": "application/json", ...headers },
-          body: JSON.stringify({ name: "one-more" }),
-        }),
-        keys.runtime,
-      ),
-    );
+  const create = async () =>
+    handleCreateApiKey(await signedCreateKey(A, { name: "one-more" }), keys.runtime);
   const blocked = await create();
   assert.equal(blocked.status, 409);
   assert.equal((blocked.body as { error: { code: string } }).error.code, LIMIT_EXCEEDED_CODE);
@@ -557,14 +588,7 @@ test("P1-03: API key, webhook endpoint, and policy creation caps return 409 limi
   const afterRevoke = await create();
   assert.equal(afterRevoke.status, 200, "revoking frees an active slot");
   // B is unaffected by A's keys.
-  const other = await handleCreateApiKey(
-    new Request("http://localhost/api/v1/api-keys", {
-      method: "POST",
-      headers: { "content-type": "application/json", ...(await walletHeaders(B, WALLET_ACTIONS.apiKeysCreate)) },
-      body: JSON.stringify({ name: "b" }),
-    }),
-    keys.runtime,
-  );
+  const other = await handleCreateApiKey(await signedCreateKey(B, { name: "b" }), keys.runtime);
   assert.equal(other.status, 200);
 
   // Webhook endpoints (real store helpers on a temp JSON file).
@@ -659,14 +683,14 @@ test("P1-04 #12/#29: an existing stored webhookUrl cannot be overwritten or hija
   assert.equal((await payPost(post({ token: v1, webhookUrl: "https://evil.example" }), box.deps)).status, 401);
   // Another merchant's wallet.
   assert.equal(
-    (await payPost(post({ token: v1, webhookUrl: "https://evil.example" }, await walletHeaders(B, WALLET_ACTIONS.paymentsRegister)), box.deps)).status,
+    (await payPost(await signedPostPay(B, { token: v1, webhookUrl: "https://evil.example", action: "register" }), box.deps)).status,
     403,
   );
   // Anyone holding the public V2 link (valid signature) re-registers with a new URL.
   const replay = await payPost(post({ token: v2, webhookUrl: "https://evil.example" }), box.deps);
   assert.equal(replay.status, 200);
   // Even the owner cannot set it: the field is retired.
-  await payPost(post({ token: v1, webhookUrl: "https://evil.example" }, await walletHeaders(A, WALLET_ACTIONS.paymentsRegister)), box.deps);
+  await payPost(await signedPostPay(A, { token: v1, webhookUrl: "https://evil.example", action: "register" }), box.deps);
   assert.equal(box.snapshot(), before);
   assert.equal(box.records.get(v1)?.webhookUrl, STORED_HOOK, "stored data is preserved, not deleted");
   for (const r of [replay]) assert.equal(JSON.stringify(r.body).includes(STORED_HOOK), false);
@@ -729,11 +753,19 @@ test("P1-05 #18/#19: unauthenticated ?to= and statement are 401 and do no store,
 
 test("P1-05 #20: merchant A cannot list or read the statement of merchant B (404, no work)", async () => {
   const box = memoryDeps([row(v1Token(B.address), B.address)]);
-  const headers = await walletHeaders(A, WALLET_ACTIONS.paymentsRead);
-  const list = await payGet(get(`http://localhost/api/pay?to=${B.address}`, headers), box.deps);
+  const list = await payGet(
+    get(`http://localhost/api/pay?to=${B.address}`, await walletHeaders(A, WALLET_ACTIONS.paymentsRead)),
+    box.deps,
+  );
   assert.equal(list.status, 404);
   assert.equal(errorCode(list.body), "not_found");
-  const statement = await statementGet(get(`http://localhost/api/statement?address=${B.address}`, headers), box.deps);
+  const statement = await statementGet(
+    get(
+      `http://localhost/api/statement?address=${B.address}`,
+      await walletHeaders(A, WALLET_ACTIONS.paymentsRead, NOW, "http://localhost/api/statement", "GET"),
+    ),
+    box.deps,
+  );
   assert.equal(statement.status, 404);
   assert.equal(box.calls.list + box.calls.find + box.calls.ledger, 0);
   assert.equal(JSON.stringify(list.body).includes(B.address.toLowerCase()), false);
@@ -752,13 +784,21 @@ test("P1-05 #21/#22: wallet-authenticated merchant reads only its own rows; plan
     row(v1Token(B.address, "tampered"), A.address),
     row(v1Token(B.address), B.address),
   ]);
-  const headers = await walletHeaders(A, WALLET_ACTIONS.paymentsRead);
-  const list = await payGet(get(`http://localhost/api/pay?to=${A.address.toLowerCase()}`, headers), box.deps);
+  const list = await payGet(
+    get(`http://localhost/api/pay?to=${A.address.toLowerCase()}`, await walletHeaders(A, WALLET_ACTIONS.paymentsRead)),
+    box.deps,
+  );
   assert.equal(list.status, 200);
   const tokens = ("records" in list.body ? list.body.records : []).map((r) => r.token).sort();
   assert.deepEqual(tokens, [mineV1, mineV2].sort());
   assert.equal(JSON.stringify(list.body).includes(STORED_HOOK), false);
-  const statement = await statementGet(get(`http://localhost/api/statement?address=${A.address}`, headers), box.deps);
+  const statement = await statementGet(
+    get(
+      `http://localhost/api/statement?address=${A.address}`,
+      await walletHeaders(A, WALLET_ACTIONS.paymentsRead, NOW, "http://localhost/api/statement", "GET"),
+    ),
+    box.deps,
+  );
   assert.equal(statement.status, 200);
   assert.deepEqual(("links" in statement.body ? statement.body.links : []).map((r) => r.token).sort(), [mineV1, mineV2].sort());
   assert.equal(box.calls.ledger, 1);
@@ -819,7 +859,7 @@ test("P1-05 #25: expensive legacy reads are rate limited before auth/store work 
 
   const merchantLimited = memoryDeps([], { limiter: deny("statement.merchant") });
   const r2 = await statementGet(
-    get(`http://localhost/api/statement?address=${A.address}`, await walletHeaders(A, WALLET_ACTIONS.paymentsRead)),
+    get(`http://localhost/api/statement?address=${A.address}`, await walletHeaders(A, WALLET_ACTIONS.paymentsRead, NOW, "http://localhost/api/statement", "GET")),
     merchantLimited.deps,
   );
   assert.equal(r2.status, 429);
@@ -866,7 +906,7 @@ test("P1-03 #27: malicious registrations cannot cause merchant-side webhook effe
   const forged = await v2Token(KEY_B, { merchant: A.address, requestByte: "61" });
   await payPost(post({ token: forged.token }), box.deps);
   await payPost(post({ token: craftedMismatchV2(B.address, A.address, "62") }), box.deps);
-  await payPost(post({ token: v1Token(A.address, "cross") }, await walletHeaders(B, WALLET_ACTIONS.paymentsRegister)), box.deps);
+  await payPost(await signedPostPay(B, { token: v1Token(A.address, "cross"), action: "register" }), box.deps);
   assert.equal(box.emitted.length, 0);
   // A genuine public V2 link replayed many times emits exactly once.
   const genuine = await v2Token(KEY_A, { merchant: A.address, requestByte: "63" });
@@ -902,24 +942,23 @@ test("client identity: forwarded headers are ignored off Vercel; Vercel platform
   assert.equal(requestClientKey(junk, { VERCEL: "1" }), "ip:unknown");
 });
 
-test("wallet header reuse: one prompt per action+merchant inside the window, concurrent callers share it", async () => {
+test("wallet header signing: each call uses a fresh single-use nonce (P2-01)", async () => {
   let prompts = 0;
   const sign = async ({ message }: { message: string }) => {
     prompts += 1;
     return A.signMessage({ message });
   };
-  const t0 = 10_000_000;
-  const [h1, h2] = await Promise.all([
-    cachedWalletHeaders(WALLET_ACTIONS.paymentsRead, A.address, sign, t0),
-    cachedWalletHeaders(WALLET_ACTIONS.paymentsRead, A.address, sign, t0),
-  ]);
-  assert.equal(prompts, 1);
-  assert.deepEqual(h1, h2);
-  await cachedWalletHeaders(WALLET_ACTIONS.paymentsRegister, A.address, sign, t0);
-  assert.equal(prompts, 2, "different action, different signature");
-  await cachedWalletHeaders(WALLET_ACTIONS.paymentsRead, A.address, sign, t0 + WALLET_SIGNATURE_REUSE_MS + 1);
+  const t0 = Date.now();
+  const a = await cachedWalletHeaders(WALLET_ACTIONS.paymentsRead, A.address, sign, { method: "GET", path: "/api/pay" }, t0);
+  const b = await cachedWalletHeaders(WALLET_ACTIONS.paymentsRead, A.address, sign, { method: "GET", path: "/api/pay" }, t0);
+  assert.notEqual(a[WALLET_AUTH_HEADERS.nonce], b[WALLET_AUTH_HEADERS.nonce]);
+  assert.equal(prompts, 2);
+  await cachedWalletHeaders(WALLET_ACTIONS.paymentsRegister, A.address, sign, {
+    method: "POST",
+    path: "/api/pay",
+    body: JSON.stringify({ token: "x", action: "register" }),
+  }, t0);
   assert.equal(prompts, 3);
-  assert.ok(WALLET_SIGNATURE_REUSE_MS < 300_000);
 });
 
 // ---------------------------------------------------------------------------

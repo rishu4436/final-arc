@@ -20,6 +20,7 @@ import {
 } from "./developerApi";
 import { deriveMemoId, type FinalRequest } from "./finalRequest";
 import { mutatePayStoreBlob, readPayStoreBlob, type AgentStoreSection, type StoreFile } from "./payStore";
+import { MAX_AGENT_IDEMPOTENCY_PER_MERCHANT } from "./resourceLimits";
 import {
   decideMachinePolicy,
   enabledPolicies,
@@ -157,6 +158,8 @@ type IdempotencyRow = {
   bodyHash: string;
   status: number;
   body: AgentIntentBody | AgentErrorBody;
+  /** Unix seconds when stored (P2-04 retention). Older rows without this sort first. */
+  storedAt?: number;
 };
 
 export type AgentChainProof = {
@@ -324,6 +327,12 @@ function sameHex(left: string, right: string): boolean {
   return left.toLowerCase() === right.toLowerCase();
 }
 
+/**
+ * Optional client-supplied label (P2-07).
+ * `agentId` is NOT an authenticated principal — any caller with agent:write may set
+ * any label. Policy `allowedAgentIds` filters on this label only; it does not prove
+ * agent identity. Treat it as an opaque tag for merchant-side correlation.
+ */
 function optionalLabel(value: unknown, field: string): string | null {
   if (value == null) return null;
   if (typeof value !== "string") fail(400, "invalid_request", `${field} must be a string.`);
@@ -495,15 +504,32 @@ function remember(
   body: AgentIntentBody | AgentErrorBody,
 ): string {
   const id = idempotencyStorageId(merchant, route, key);
-  writeSection(store).idempotency[id] = {
+  const section = writeSection(store);
+  section.idempotency[id] = {
     merchant,
     route,
     key,
     bodyHash,
     status,
     body,
+    storedAt: Math.floor(Date.now() / 1000),
   } satisfies IdempotencyRow;
+  pruneMerchantIdempotency(section.idempotency, merchant);
   return id;
+}
+
+function pruneMerchantIdempotency(rows: Record<string, unknown>, merchant: string): void {
+  const needle = merchant.toLowerCase();
+  const mine: { id: string; at: number }[] = [];
+  for (const [id, value] of Object.entries(rows)) {
+    const row = readIdempotency(value);
+    if (!row || row.merchant.toLowerCase() !== needle) continue;
+    mine.push({ id, at: typeof row.storedAt === "number" ? row.storedAt : 0 });
+  }
+  if (mine.length <= MAX_AGENT_IDEMPOTENCY_PER_MERCHANT) return;
+  mine.sort((a, b) => a.at - b.at);
+  const drop = mine.length - MAX_AGENT_IDEMPOTENCY_PER_MERCHANT;
+  for (let i = 0; i < drop; i += 1) delete rows[mine[i].id];
 }
 
 /**
@@ -528,10 +554,23 @@ async function persistTouched(
   const from = readSection(source);
   const reservations = policyTouch?.reservations ?? [];
   const denials = policyTouch?.denials ?? [];
+  let settlementConflict = false;
   await deps.mutateBlob((fresh) => {
+    settlementConflict = false;
     const to = writeSection(fresh);
     for (const id of intentIds) {
       if (from.intents[id] !== undefined) {
+        const incoming = readIntent(from.intents[id]);
+        // P2-06: re-check verified tx uniqueness on the latest CAS snapshot.
+        if (
+          incoming &&
+          incoming.status === "VERIFIED" &&
+          typeof incoming.verifiedTxHash === "string" &&
+          hashUsedByOther(fresh, incoming.verifiedTxHash, id)
+        ) {
+          settlementConflict = true;
+          continue;
+        }
         to.intents[id] = mergeAgentIntent(to.intents[id], from.intents[id]);
       }
     }
@@ -564,6 +603,9 @@ async function persistTouched(
       }
     }
   });
+  if (settlementConflict) {
+    fail(409, "settlement_used", "This transaction is already verified for a different intent.");
+  }
 }
 
 function lookupIdempotency(

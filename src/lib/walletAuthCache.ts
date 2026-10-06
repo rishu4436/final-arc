@@ -1,42 +1,29 @@
 import { getAddress, type Address, type Hex } from "viem";
-import { WALLET_AUTH_TOLERANCE_SECONDS, type WalletAction } from "./apiScopes";
-import { signedWalletHeaders } from "./signedWalletHeaders";
+import type { WalletAction } from "./apiScopes";
+import { signedWalletHeaders, type WalletAuthBinding } from "./signedWalletHeaders";
 
 /**
- * Browser-side reuse of the existing FINAL wallet authorization headers.
- * No new protocol: this calls signedWalletHeaders (same message the server
- * rebuilds in recoverWalletMerchant). It only avoids prompting the wallet on
- * every dashboard fetch by reusing one signature per (action, merchant) for
- * 4 minutes, inside the server's 300-second window. Concurrent callers share
- * one pending prompt. Nothing is persisted; the cache is this tab's memory.
+ * Browser helper for FINAL wallet authorization headers.
+ *
+ * P2-01: every signature carries a one-time server-consumed nonce, so cached
+ * reuse is unsafe and is not performed. Each call prompts (or uses the wallet
+ * provider's own session) for a fresh signature bound to method/path/body.
  */
-export const WALLET_SIGNATURE_REUSE_MS = Math.min(4 * 60 * 1000, (WALLET_AUTH_TOLERANCE_SECONDS - 30) * 1000);
-
-type Entry = { at: number; headers: Promise<Record<string, string>> };
-const cache = new Map<string, Entry>();
-
-function slot(action: WalletAction, merchant: Address): string {
-  return `${action}\u0000${getAddress(merchant)}`;
-}
+export const WALLET_SIGNATURE_REUSE_MS = 0;
 
 export function cachedWalletHeaders(
   action: WalletAction,
   merchant: Address,
   signMessage: (args: { message: string }) => Promise<Hex>,
-  now: number = Date.now(),
+  binding: WalletAuthBinding,
+  _now: number = Date.now(),
 ): Promise<Record<string, string>> {
-  const key = slot(action, merchant);
-  const hit = cache.get(key);
-  if (hit && now - hit.at < WALLET_SIGNATURE_REUSE_MS) return hit.headers;
-  const headers = signedWalletHeaders(action, merchant, signMessage);
-  cache.set(key, { at: now, headers });
-  headers.catch(() => {
-    if (cache.get(key)?.headers === headers) cache.delete(key);
-  });
-  return headers;
+  void _now;
+  void getAddress(merchant);
+  return signedWalletHeaders(action, merchant, signMessage, binding);
 }
 
-/** Drop a cached signature, e.g. after the server rejects it. */
-export function forgetWalletHeaders(action: WalletAction, merchant: Address): void {
-  cache.delete(slot(action, merchant));
+/** No-op retained for call sites that drop a rejected signature. */
+export function forgetWalletHeaders(_action: WalletAction, _merchant: Address): void {
+  /* single-use nonces — nothing to forget */
 }

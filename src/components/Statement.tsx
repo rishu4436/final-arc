@@ -72,7 +72,7 @@ export function Statement() {
       // Phase 13 (P1-05): the statement is merchant-private. It requires the existing
       // wallet authorization for this address ("payments.read").
       const load = async () => {
-        const headers = await cachedWalletHeaders(WALLET_ACTIONS.paymentsRead, address, sign);
+        const headers = await cachedWalletHeaders(WALLET_ACTIONS.paymentsRead, address, sign, { method: "GET", path: "/api/pay" });
         const res = await fetch(`/api/statement?address=${address}`, { headers, cache: "no-store" });
         if (res.status === 401) forgetWalletHeaders(WALLET_ACTIONS.paymentsRead, address);
         const body = (await res.json()) as {

@@ -13,9 +13,9 @@ import {
   DEFAULT_API_KEY_SCOPES,
   WALLET_ACTIONS,
   WALLET_AUTH_HEADERS,
-  walletAuthMessage,
   type ApiScope,
 } from "./apiScopes";
+import { signedWalletRequest, withMemoryNonces } from "./walletAuthTest";
 import { ARC_CHAIN_ID } from "./arc";
 import { createFakeRedis } from "./fakeRedisRest";
 import { encodePayRequest, encodeV2PayRequest } from "./payRequest";
@@ -353,7 +353,7 @@ function harness(opts: { ledger?: "redis" | "unavailable"; blob?: StoreFile; rea
     opts.ledger === "unavailable" ? unavailablePolicyLedger() : redisPolicyLedger({ url: "https://kv.fake", token: "t" }, redis.fetch);
   const h: Harness = { blob, commits: 0, reads: [], redis, touched: [], deps: undefined as unknown as AnalyticsDeps };
   const keys = apiKeys();
-  const apiKeyAuth: ApiKeyRuntime = {
+  const apiKeyAuth: ApiKeyRuntime = withMemoryNonces({
     nowSeconds: () => NOW,
     pepper: PEPPER,
     rateLimitPerMinute: 1_000_000,
@@ -367,7 +367,7 @@ function harness(opts: { ledger?: "redis" | "unavailable"; blob?: StoreFile; rea
     touchLastUsed: async (id) => {
       h.touched.push(id);
     },
-  };
+  });
   // Full ledger passed in, with a commit spy. Analytics only has read() in its type.
   const spy: PolicyLedger = {
     mode: base.mode,
@@ -400,13 +400,30 @@ function bearer(secret: string): Record<string, string> {
   return { authorization: `Bearer ${secret}` };
 }
 
-async function walletHeaders(action: string, account = A, signer = account) {
-  const signature = await signer.signMessage({ message: walletAuthMessage(action, account.address, NOW) });
-  return {
-    [WALLET_AUTH_HEADERS.merchant]: account.address,
-    [WALLET_AUTH_HEADERS.timestamp]: String(NOW),
-    [WALLET_AUTH_HEADERS.signature]: signature,
-  };
+async function walletHeaders(
+  action: string,
+  account = A,
+  signer = account,
+  url = "https://pay.example/api/v1/analytics/overview",
+  method = "GET",
+  body?: unknown,
+) {
+  const req = await signedWalletRequest({
+    account: {
+      address: account.address,
+      signMessage: (args) => signer.signMessage(args),
+    },
+    action,
+    url,
+    method,
+    body,
+    timestamp: NOW,
+  });
+  const headers: Record<string, string> = {};
+  req.headers.forEach((value, key) => {
+    headers[key] = value;
+  });
+  return headers;
 }
 
 function deepFreeze<T>(value: T): T {

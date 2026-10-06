@@ -1,4 +1,4 @@
-import { authorizeHttp } from "@/lib/apiKeys";
+import { authorizeHttp, parseJsonObject, readRequestBodyText } from "@/lib/apiKeys";
 import { WALLET_ACTIONS } from "@/lib/apiScopes";
 import {
   defaultWebhookDeps,
@@ -20,6 +20,7 @@ export async function GET(request: Request, ctx: Ctx) {
   const auth = await authorizeHttp(request, {
     scope: "webhooks:read",
     walletAction: WALLET_ACTIONS.webhooksGet,
+    bodyText: "",
   });
   if (!("merchant" in auth)) return NextResponse.json(auth.body, { status: auth.status });
   const result = await getWebhookEndpoint(id, auth.merchant, depsFor(auth.merchant));
@@ -28,27 +29,19 @@ export async function GET(request: Request, ctx: Ctx) {
 
 export async function PATCH(request: Request, ctx: Ctx) {
   const { id } = await ctx.params;
+  const bodyText = await readRequestBodyText(request);
   const auth = await authorizeHttp(request, {
     scope: "webhooks:write",
     walletAction: WALLET_ACTIONS.webhooksUpdate,
+    bodyText,
   });
   if (!("merchant" in auth)) return NextResponse.json(auth.body, { status: auth.status });
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return NextResponse.json(
-      { error: { code: "invalid_json", message: "Request body must be JSON." } },
-      { status: 400 },
-    );
+  const parsed = parseJsonObject(bodyText);
+  if ("status" in parsed) {
+    const err = parsed as { status: number; body: unknown };
+    return NextResponse.json(err.body, { status: err.status });
   }
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
-    return NextResponse.json(
-      { error: { code: "invalid_json", message: "Request body must be a JSON object." } },
-      { status: 400 },
-    );
-  }
-  const input = body as Record<string, unknown>;
+  const input = parsed;
   const result = await updateWebhookEndpoint(
     id,
     {
@@ -68,6 +61,7 @@ export async function DELETE(request: Request, ctx: Ctx) {
   const auth = await authorizeHttp(request, {
     scope: "webhooks:write",
     walletAction: WALLET_ACTIONS.webhooksDelete,
+    bodyText: "",
   });
   if (!("merchant" in auth)) return NextResponse.json(auth.body, { status: auth.status });
   const result = await deleteWebhookEndpoint(id, auth.merchant, depsFor(auth.merchant));

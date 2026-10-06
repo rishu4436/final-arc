@@ -39,6 +39,8 @@ export const WALLET_AUTH_HEADERS = {
   merchant: "x-final-wallet-merchant",
   timestamp: "x-final-wallet-timestamp",
   signature: "x-final-wallet-signature",
+  /** One-time server-consumed nonce (32-byte hex). Required for every wallet auth. */
+  nonce: "x-final-wallet-nonce",
 } as const;
 
 export const WALLET_ACTIONS = {
@@ -81,9 +83,32 @@ export const WALLET_ACTIONS = {
 
 export type WalletAction = (typeof WALLET_ACTIONS)[keyof typeof WALLET_ACTIONS];
 
-/** Canonical message. The server rebuilds it from the action, checksum merchant, and timestamp. */
-export function walletAuthMessage(action: string, merchant: string, timestamp: number): string {
-  return `FINAL wallet authorization\naction:${action}\nmerchant:${merchant}\ntimestamp:${timestamp}`;
+/**
+ * Canonical wallet-auth message (P2-01).
+ * Binds action, merchant, timestamp, one-time nonce, and a payload digest of
+ * METHOD + path + raw body so a captured signature cannot authorize a different
+ * write. The server rebuilds this string and recovers the signer.
+ */
+export function walletAuthMessage(
+  action: string,
+  merchant: string,
+  timestamp: number,
+  nonce: string,
+  payloadDigest: string,
+): string {
+  return (
+    `FINAL wallet authorization\n` +
+    `action:${action}\n` +
+    `merchant:${merchant}\n` +
+    `timestamp:${timestamp}\n` +
+    `nonce:${nonce}\n` +
+    `payload:${payloadDigest}`
+  );
+}
+
+/** UTF-8 input hashed (SHA-256 hex) for the payload field. Browser and server must agree. */
+export function walletAuthPayloadInput(method: string, path: string, bodyText: string): string {
+  return `${method.toUpperCase()}\n${path}\n${bodyText}`;
 }
 
 export function isApiScope(value: string): value is ApiScope {

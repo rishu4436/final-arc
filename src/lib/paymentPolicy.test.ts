@@ -4,7 +4,8 @@ import { test } from "node:test";
 import type { Address, Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { hashApiSecret, type ApiKeyRecord, type ApiKeyRuntime } from "./apiKeys";
-import { API_SCOPES, DEFAULT_API_KEY_SCOPES, WALLET_ACTIONS, WALLET_AUTH_HEADERS, walletAuthMessage, type ApiScope } from "./apiScopes";
+import { API_SCOPES, DEFAULT_API_KEY_SCOPES, WALLET_ACTIONS, type ApiScope } from "./apiScopes";
+import { signedWalletRequest, withMemoryNonces } from "./walletAuthTest";
 import { ARC_CHAIN_ID, USDC_ADDRESS } from "./arc";
 import { createAgentPaymentIntent, getAgentPaymentIntent, submitAgentPaymentIntent, type AgentPaymentsDeps } from "./agentPayments";
 import type { ArcProofBody } from "./arcProof";
@@ -114,7 +115,7 @@ function box(
     result: { status: "NOT_FOUND", transactionHash: hash },
     blockTimestamp: null,
   });
-  const apiKeyAuth: ApiKeyRuntime = {
+  const apiKeyAuth: ApiKeyRuntime = withMemoryNonces({
     nowSeconds: () => clock,
     pepper: PEPPER,
     rateLimitPerMinute: 1_000_000,
@@ -122,7 +123,7 @@ function box(
     upsertKey: async () => undefined,
     createKey: async () => undefined,
     touchLastUsed: async () => undefined,
-  };
+  });
   const emit = (input: { type: string; data?: Record<string, unknown> }) => {
     events.push(input);
   };
@@ -293,17 +294,26 @@ function errorOf(body: unknown): { code: string; message: string; reasons?: { co
   return (body as { error: { code: string; message: string; reasons?: { code: string }[] } }).error;
 }
 
-async function walletHeaders(action: (typeof WALLET_ACTIONS)[keyof typeof WALLET_ACTIONS], account = merchant) {
-  const timestamp = NOW;
-  const signature = await account.signMessage({
-    message: walletAuthMessage(action, account.address, timestamp),
+async function walletHeaders(
+  action: (typeof WALLET_ACTIONS)[keyof typeof WALLET_ACTIONS],
+  account = merchant,
+  url = "https://pay.example/api/v1/policies",
+  method = "GET",
+  body?: unknown,
+) {
+  const req = await signedWalletRequest({
+    account,
+    action,
+    url,
+    method,
+    body,
+    timestamp: NOW,
   });
-  return {
-    [WALLET_AUTH_HEADERS.merchant]: account.address,
-    [WALLET_AUTH_HEADERS.timestamp]: String(timestamp),
-    [WALLET_AUTH_HEADERS.signature]: signature,
-    "content-type": "application/json",
-  };
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  req.headers.forEach((value, key) => {
+    headers[key] = value;
+  });
+  return headers;
 }
 
 test("evaluatePaymentPolicy is deterministic and has no side effects", () => {
@@ -557,12 +567,19 @@ test("default scopes omit policy scopes", () => {
 
 test("wallet can create a policy and an agent key cannot", async () => {
   const h = box(["agent:write"]);
-  const headers = await walletHeaders(WALLET_ACTIONS.policiesCreate);
+  const createBody = { name: "ops", rules: { maxAmountBaseUnits: "1000000" } };
+  const headers = await walletHeaders(
+    WALLET_ACTIONS.policiesCreate,
+    merchant,
+    "https://pay.example/api/v1/policies",
+    "POST",
+    createBody,
+  );
   const created = await createPolicy(
     new Request("https://pay.example/api/v1/policies", {
       method: "POST",
       headers,
-      body: JSON.stringify({ name: "ops", rules: { maxAmountBaseUnits: "1000000" } }),
+      body: JSON.stringify(createBody),
     }),
     h.policyDeps,
   );
@@ -587,7 +604,14 @@ test("wallet can create a policy and an agent key cannot", async () => {
   assert.equal(listed.status, 200);
   assert.equal((listed.body as { policies: PaymentPolicy[] }).policies.length, 1);
   const foreign = await getPolicy(
-    new Request(`https://pay.example/api/v1/policies/${id}`, { headers: await walletHeaders(WALLET_ACTIONS.policiesGet, other) }),
+    new Request(`https://pay.example/api/v1/policies/${id}`, {
+      headers: await walletHeaders(
+        WALLET_ACTIONS.policiesGet,
+        other,
+        `https://pay.example/api/v1/policies/${id}`,
+        "GET",
+      ),
+    }),
     id,
     h.policyDeps,
   );

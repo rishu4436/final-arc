@@ -54,7 +54,7 @@ export function HistoryList() {
     const sign = (args: { message: string }) => signRef.current(args);
     // Phase 13 (P1-05): the payee list requires the existing wallet authorization ("payments.read").
     const load = async () => {
-      const headers = await cachedWalletHeaders(WALLET_ACTIONS.paymentsRead, address, sign);
+      const headers = await cachedWalletHeaders(WALLET_ACTIONS.paymentsRead, address, sign, { method: "GET", path: "/api/pay" });
       const res = await fetch(`/api/pay?to=${address}`, { headers, cache: "no-store" });
       if (res.status === 401) forgetWalletHeaders(WALLET_ACTIONS.paymentsRead, address);
       const body = (await res.json()) as { records?: PayRecord[]; error?: string };

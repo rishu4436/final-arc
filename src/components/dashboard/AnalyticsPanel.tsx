@@ -263,7 +263,10 @@ export function AnalyticsPanel() {
     if (!merchant) throw new Error("Wallet is not connected.");
     const cached = auth.current;
     if (cached && cached.merchant === merchant && Date.now() - cached.at < SIGNATURE_REUSE_MS) return cached.headers;
-    const fresh = await signedWalletHeaders(WALLET_ACTIONS.analyticsRead, merchant, (args) => signMessageAsync(args));
+    const fresh = await signedWalletHeaders(WALLET_ACTIONS.analyticsRead, merchant, (args) => signMessageAsync(args), {
+      method: "GET",
+      path: "/api/v1/analytics",
+    });
     auth.current = { merchant, at: Date.now(), headers: fresh };
     return fresh;
   }, [merchant, signMessageAsync]);

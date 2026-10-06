@@ -27,6 +27,16 @@ export const MAX_STORED_API_KEYS_PER_MERCHANT = 200;
 export const MAX_WEBHOOK_ENDPOINTS_PER_MERCHANT = 20;
 /** Payment policies per merchant. Delete removes the row. */
 export const MAX_POLICIES_PER_MERCHANT = 50;
+/**
+ * P2-04: bounded denial audit history per merchant (oldest dropped on write).
+ * Active spend reservations are never pruned here.
+ */
+export const MAX_POLICY_DENIALS_PER_MERCHANT = 500;
+/**
+ * P2-04: bounded agent idempotency rows per merchant (oldest dropped on write).
+ * Intent rows themselves are not pruned by this ceiling.
+ */
+export const MAX_AGENT_IDEMPOTENCY_PER_MERCHANT = 500;
 
 export const LIMIT_EXCEEDED_CODE = "limit_exceeded";
 

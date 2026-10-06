@@ -93,9 +93,10 @@ function eventData(row: EscrowRecord): Record<string, unknown> {
   };
 }
 
-async function readJson(request: Request): Promise<Record<string, unknown> | EscrowResult> {
+
+function parseBodyText(raw: string): Record<string, unknown> | EscrowResult {
   try {
-    const parsed = (await request.json()) as unknown;
+    const parsed = raw.length === 0 ? null : JSON.parse(raw);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       return err(400, "invalid_json", "Request body must be a JSON object.");
     }
@@ -116,11 +117,12 @@ async function authorize(
   scope: ApiScope,
   walletAction: WalletAction,
   deps: EscrowDeps,
+  bodyText = "",
 ): Promise<Auth | EscrowResult> {
   const header = request.headers.get("authorization");
   const result = await authorizeHttp(
     request,
-    { scope, walletAction, allowBearer: true },
+    { scope, walletAction, allowBearer: true, bodyText },
     deps.runtime,
   );
   if (!("ok" in result)) return result;
@@ -182,9 +184,10 @@ export function asEscrowRecord(value: unknown): EscrowRecord | null {
 }
 
 export async function createEscrow(request: Request, deps: EscrowDeps): Promise<EscrowResult> {
-  const auth = await authorize(request, "escrow:write", WALLET_ACTIONS.escrowsCreate, deps);
+  const raw = await request.text().catch(() => "");
+  const auth = await authorize(request, "escrow:write", WALLET_ACTIONS.escrowsCreate, deps, raw);
   if ("status" in auth) return auth;
-  const body = await readJson(request);
+  const body = parseBodyText(raw);
   if (isError(body)) return body;
   if (body.chainId !== undefined && body.chainId !== arcChainId()) {
     return err(400, "invalid_chain", "Escrow chainId must be 5042.");
@@ -240,7 +243,7 @@ export async function createEscrow(request: Request, deps: EscrowDeps): Promise<
 }
 
 export async function listEscrows(request: Request, deps: EscrowDeps): Promise<EscrowResult> {
-  const auth = await authorize(request, "escrow:read", WALLET_ACTIONS.escrowsList, deps);
+  const auth = await authorize(request, "escrow:read", WALLET_ACTIONS.escrowsList, deps, "");
   if ("status" in auth) return auth;
   const rows = (await deps.list())
     .filter((row) => getAddress(row.creator) === auth.merchant)
@@ -248,9 +251,9 @@ export async function listEscrows(request: Request, deps: EscrowDeps): Promise<E
   return { status: 200, body: { escrows: rows.map((row) => publicEscrow(row, deps.chain)) } };
 }
 
-async function loadOwned(id: string, request: Request, scope: ApiScope, action: WalletAction, deps: EscrowDeps, partyRead: boolean) {
+async function loadOwned(id: string, request: Request, scope: ApiScope, action: WalletAction, deps: EscrowDeps, partyRead: boolean, bodyText = "") {
   if (!isBytes32(id)) return err(404, "not_found", "Escrow not found.");
-  const auth = await authorize(request, scope, action, deps);
+  const auth = await authorize(request, scope, action, deps, bodyText);
   if ("status" in auth) return auth;
   const row = (await deps.list()).find((item) => item.escrowId.toLowerCase() === id.toLowerCase());
   if (!row) return err(404, "not_found", "Escrow not found.");
@@ -544,9 +547,10 @@ async function applyChainTransition(
 }
 
 export async function openEscrow(request: Request, id: string, deps: EscrowDeps): Promise<EscrowResult> {
-  const loaded = await loadOwned(id, request, "escrow:write", WALLET_ACTIONS.escrowsOpen, deps, false);
+  const raw = await request.text().catch(() => "");
+  const loaded = await loadOwned(id, request, "escrow:write", WALLET_ACTIONS.escrowsOpen, deps, false, raw);
   if ("status" in loaded) return loaded;
-  const body = await readJson(request);
+  const body = parseBodyText(raw);
   if (isError(body)) return body;
   const conflict = rejectClientTerms(body, loaded.row);
   if (conflict) return conflict;
@@ -570,9 +574,10 @@ export async function openEscrow(request: Request, id: string, deps: EscrowDeps)
 }
 
 export async function fundEscrow(request: Request, id: string, deps: EscrowDeps): Promise<EscrowResult> {
-  const loaded = await loadOwned(id, request, "escrow:write", WALLET_ACTIONS.escrowsFund, deps, false);
+  const raw = await request.text().catch(() => "");
+  const loaded = await loadOwned(id, request, "escrow:write", WALLET_ACTIONS.escrowsFund, deps, false, raw);
   if ("status" in loaded) return loaded;
-  const body = await readJson(request);
+  const body = parseBodyText(raw);
   if (isError(body)) return body;
   const conflict = rejectClientTerms(body, loaded.row);
   if (conflict) return conflict;
@@ -646,9 +651,10 @@ async function prepareSettlement(row: EscrowRecord, deps: EscrowDeps, action: "r
 }
 
 export async function releaseEscrow(request: Request, id: string, deps: EscrowDeps): Promise<EscrowResult> {
-  const loaded = await loadOwned(id, request, "escrow:write", WALLET_ACTIONS.escrowsRelease, deps, false);
+  const raw = await request.text().catch(() => "");
+  const loaded = await loadOwned(id, request, "escrow:write", WALLET_ACTIONS.escrowsRelease, deps, false, raw);
   if ("status" in loaded) return loaded;
-  const body = await readJson(request);
+  const body = parseBodyText(raw);
   if (isError(body)) return body;
   const conflict = rejectClientTerms(body, loaded.row);
   if (conflict) return conflict;
@@ -657,9 +663,10 @@ export async function releaseEscrow(request: Request, id: string, deps: EscrowDe
 }
 
 export async function refundEscrow(request: Request, id: string, deps: EscrowDeps): Promise<EscrowResult> {
-  const loaded = await loadOwned(id, request, "escrow:write", WALLET_ACTIONS.escrowsRefund, deps, false);
+  const raw = await request.text().catch(() => "");
+  const loaded = await loadOwned(id, request, "escrow:write", WALLET_ACTIONS.escrowsRefund, deps, false, raw);
   if ("status" in loaded) return loaded;
-  const body = await readJson(request);
+  const body = parseBodyText(raw);
   if (isError(body)) return body;
   const conflict = rejectClientTerms(body, loaded.row);
   if (conflict) return conflict;
@@ -668,9 +675,10 @@ export async function refundEscrow(request: Request, id: string, deps: EscrowDep
 }
 
 export async function cancelEscrow(request: Request, id: string, deps: EscrowDeps): Promise<EscrowResult> {
-  const loaded = await loadOwned(id, request, "escrow:write", WALLET_ACTIONS.escrowsCancel, deps, false);
+  const raw = await request.text().catch(() => "");
+  const loaded = await loadOwned(id, request, "escrow:write", WALLET_ACTIONS.escrowsCancel, deps, false, raw);
   if ("status" in loaded) return loaded;
-  const body = await readJson(request);
+  const body = parseBodyText(raw);
   if (isError(body)) return body;
   const conflict = rejectClientTerms(body, loaded.row);
   if (conflict) return conflict;

@@ -13,7 +13,7 @@ import {
   type Hex,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { generateApiSecret, hashApiSecret, type ApiKeyRecord, type ApiKeyRuntime } from "./apiKeys";
+import { apiKeyPrefix, generateApiSecret, hashApiSecret, type ApiKeyRecord, type ApiKeyRuntime } from "./apiKeys";
 import { API_SCOPES } from "./apiScopes";
 import { escrowAbi } from "./escrowAbi";
 import { addressWord, approveCall, idCall, manualCalldata, openCall, uintWord, voidCall } from "./escrowCall";
@@ -63,7 +63,7 @@ function issue(merchant: Address): { secret: string; row: ApiKeyRecord } {
       id: `key_${secret.slice(-8)}`,
       merchant,
       name: "escrow",
-      prefix: secret.slice(0, 16),
+      prefix: apiKeyPrefix(secret),
       hash: hashApiSecret(secret, PEPPER),
       scopes: [...API_SCOPES],
       enabled: true,

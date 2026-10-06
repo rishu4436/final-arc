@@ -82,9 +82,12 @@ export function WebhooksPanel() {
   const emittable = useMemo(() => EMITTABLE_WEBHOOK_EVENTS.filter((e) => e !== "webhook.test"), []);
 
   const authHeaders = useCallback(
-    async (action: (typeof WALLET_ACTIONS)[keyof typeof WALLET_ACTIONS]) => {
+    async (
+      action: (typeof WALLET_ACTIONS)[keyof typeof WALLET_ACTIONS],
+      binding: { method: string; path: string; body?: string },
+    ) => {
       if (!merchant) throw new Error("Wallet is not connected.");
-      return signedWalletHeaders(action, merchant, (args) => signMessageAsync(args));
+      return signedWalletHeaders(action, merchant, (args) => signMessageAsync(args), binding);
     },
     [merchant, signMessageAsync],
   );
@@ -94,7 +97,7 @@ export function WebhooksPanel() {
     setLoading(true);
     setError(null);
     try {
-      const headers = await authHeaders(WALLET_ACTIONS.webhooksList);
+      const headers = await authHeaders(WALLET_ACTIONS.webhooksList, { method: "GET", path: "/api/v1/webhooks" });
       const res = await fetch("/api/v1/webhooks", { headers });
       const body = await res.json();
       if (!res.ok) {
@@ -120,7 +123,7 @@ export function WebhooksPanel() {
       if (!merchant) return;
       setActiveId(id);
       try {
-        const headers = await authHeaders(WALLET_ACTIONS.webhooksDeliveries);
+        const headers = await authHeaders(WALLET_ACTIONS.webhooksDeliveries, { method: "GET", path: `/api/v1/webhooks/${encodeURIComponent(id)}/deliveries` });
         const res = await fetch(`/api/v1/webhooks/${encodeURIComponent(id)}/deliveries`, { headers });
         const body = await res.json();
         if (!res.ok) {
@@ -146,11 +149,16 @@ export function WebhooksPanel() {
     setBusy(true);
     setError(null);
     try {
-      const headers = await authHeaders(WALLET_ACTIONS.webhooksCreate);
+      const bodyText = JSON.stringify({ url, events: selected });
+      const headers = await authHeaders(WALLET_ACTIONS.webhooksCreate, {
+        method: "POST",
+        path: "/api/v1/webhooks",
+        body: bodyText,
+      });
       const res = await fetch("/api/v1/webhooks", {
         method: "POST",
         headers: { ...headers, "content-type": "application/json" },
-        body: JSON.stringify({ url, events: selected }),
+        body: bodyText,
       });
       const body = await res.json();
       if (!res.ok) {
@@ -174,11 +182,17 @@ export function WebhooksPanel() {
     setBusy(true);
     setError(null);
     try {
-      const headers = await authHeaders(WALLET_ACTIONS.webhooksUpdate);
-      const res = await fetch(`/api/v1/webhooks/${encodeURIComponent(id)}`, {
+      const path = `/api/v1/webhooks/${encodeURIComponent(id)}`;
+      const bodyText = JSON.stringify(patchBody);
+      const headers = await authHeaders(WALLET_ACTIONS.webhooksUpdate, {
+        method: "PATCH",
+        path,
+        body: bodyText,
+      });
+      const res = await fetch(path, {
         method: "PATCH",
         headers: { ...headers, "content-type": "application/json" },
-        body: JSON.stringify(patchBody),
+        body: bodyText,
       });
       const body = await res.json();
       if (!res.ok) {
@@ -203,7 +217,7 @@ export function WebhooksPanel() {
     setBusy(true);
     setError(null);
     try {
-      const headers = await authHeaders(WALLET_ACTIONS.webhooksDelete);
+      const headers = await authHeaders(WALLET_ACTIONS.webhooksDelete, { method: "DELETE", path: `/api/v1/webhooks/${encodeURIComponent(id)}` });
       const res = await fetch(`/api/v1/webhooks/${encodeURIComponent(id)}`, {
         method: "DELETE",
         headers,
@@ -230,7 +244,7 @@ export function WebhooksPanel() {
     setBusy(true);
     setError(null);
     try {
-      const headers = await authHeaders(WALLET_ACTIONS.webhooksTest);
+      const headers = await authHeaders(WALLET_ACTIONS.webhooksTest, { method: "POST", path: `/api/v1/webhooks/${encodeURIComponent(id)}/test`, body: "" });
       const res = await fetch(`/api/v1/webhooks/${encodeURIComponent(id)}/test`, {
         method: "POST",
         headers,

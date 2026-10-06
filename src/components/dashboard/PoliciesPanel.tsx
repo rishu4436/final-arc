@@ -60,9 +60,12 @@ export function PoliciesPanel() {
   const merchant = address ?? null;
 
   const authHeaders = useCallback(
-    async (action: (typeof WALLET_ACTIONS)[keyof typeof WALLET_ACTIONS]) => {
+    async (
+      action: (typeof WALLET_ACTIONS)[keyof typeof WALLET_ACTIONS],
+      binding: { method: string; path: string; body?: string },
+    ) => {
       if (!merchant) throw new Error("Wallet is not connected.");
-      return signedWalletHeaders(action, merchant, (args) => signMessageAsync(args));
+      return signedWalletHeaders(action, merchant, (args) => signMessageAsync(args), binding);
     },
     [merchant, signMessageAsync],
   );
@@ -71,7 +74,7 @@ export function PoliciesPanel() {
     if (!merchant) return;
     setError(null);
     try {
-      const headers = await authHeaders(WALLET_ACTIONS.policiesList);
+      const headers = await authHeaders(WALLET_ACTIONS.policiesList, { method: "GET", path: "/api/v1/policies" });
       const res = await fetch("/api/v1/policies", { headers });
       const body = await res.json();
       if (!res.ok) {
@@ -113,11 +116,16 @@ export function PoliciesPanel() {
     setBusy(true);
     setError(null);
     try {
-      const headers = await authHeaders(WALLET_ACTIONS.policiesCreate);
+      const bodyText = JSON.stringify({ name: name.trim(), rules });
+      const headers = await authHeaders(WALLET_ACTIONS.policiesCreate, {
+        method: "POST",
+        path: "/api/v1/policies",
+        body: bodyText,
+      });
       const res = await fetch("/api/v1/policies", {
         method: "POST",
         headers: { ...headers, "content-type": "application/json" },
-        body: JSON.stringify({ name: name.trim(), rules }),
+        body: bodyText,
       });
       const body = await res.json();
       if (!res.ok) {
@@ -145,11 +153,17 @@ export function PoliciesPanel() {
     setBusy(true);
     setError(null);
     try {
-      const headers = await authHeaders(WALLET_ACTIONS.policiesUpdate);
-      const res = await fetch(`/api/v1/policies/${encodeURIComponent(policy.id)}`, {
+      const path = `/api/v1/policies/${encodeURIComponent(policy.id)}`;
+      const bodyText = JSON.stringify(input);
+      const headers = await authHeaders(WALLET_ACTIONS.policiesUpdate, {
+        method: "PATCH",
+        path,
+        body: bodyText,
+      });
+      const res = await fetch(path, {
         method: "PATCH",
         headers: { ...headers, "content-type": "application/json" },
-        body: JSON.stringify(input),
+        body: bodyText,
       });
       const body = await res.json();
       if (!res.ok) {
@@ -170,8 +184,9 @@ export function PoliciesPanel() {
     setBusy(true);
     setError(null);
     try {
-      const headers = await authHeaders(WALLET_ACTIONS.policiesDelete);
-      const res = await fetch(`/api/v1/policies/${encodeURIComponent(policy.id)}`, {
+      const path = `/api/v1/policies/${encodeURIComponent(policy.id)}`;
+      const headers = await authHeaders(WALLET_ACTIONS.policiesDelete, { method: "DELETE", path });
+      const res = await fetch(path, {
         method: "DELETE",
         headers,
       });
@@ -193,7 +208,8 @@ export function PoliciesPanel() {
       <h2 className="display text-2xl">Policies</h2>
       <p className="mt-3 text-sm text-[var(--muted)]">
         Policies authorize machine payment intents. They do not sign or broadcast blockchain transactions. Checkout is
-        unchanged. Version 1. Amounts are USDC base units.
+        unchanged. Version 1. Amounts are USDC base units. Agent id allowlists filter a client-supplied label only — they
+        do not authenticate an agent principal.
       </p>
       {!merchant ? <p className="mt-4 text-sm">Connect the merchant wallet to manage policies.</p> : null}
       {error ? <p className="mt-4 text-sm text-red-400">{error}</p> : null}

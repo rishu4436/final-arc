@@ -1,4 +1,6 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { lookup as dnsLookup } from "node:dns/promises";
+import { safeLog } from "./safeLog";
 import { getAddress, isAddress, parseUnits, type Address } from "viem";
 import { deriveMemoId } from "./finalRequest";
 import { decodePayLink } from "./payRequest";
@@ -132,6 +134,8 @@ export type WebhookDeps = {
    * Missing caller is 401. A claimed merchant that differs is not trusted.
    */
   caller?: Address;
+  /** P2-03: DNS resolution for destination checks. Defaults to dns.lookup. Tests inject stubs. */
+  resolveHost?: (hostname: string) => Promise<string[]>;
 };
 
 export const WEBHOOK_ERROR_CODES = {
@@ -272,9 +276,13 @@ export function retryDelaySeconds(failedAttempt: number): number | null {
 }
 
 /**
- * Absolute https URLs only. Rejects userinfo, localhost, private and link-local
- * IPv4, and common cloud metadata hosts. Hostname literals that are not IPs are
- * allowed (DNS rebinding is out of scope for this phase).
+ * Absolute https URLs only. Rejects userinfo, localhost, private/link-local/metadata
+ * IPv4 and IPv6 literals. Hostname DNS is re-checked immediately before HTTP
+ * (assertSafeWebhookDestination). Redirects are disabled on dispatch.
+ *
+ * Residual (documented): Node fetch cannot pin the TCP connect to the exact
+ * pre-resolved address, so a DNS-rebinding TOCTOU between lookup and connect
+ * remains. Consumers should treat webhook delivery as at-least-once to public HTTPS.
  */
 export function validateWebhookUrl(raw: string): string {
   let url: URL;
@@ -294,7 +302,9 @@ export function validateWebhookUrl(raw: string): string {
     host === "localhost" ||
     host === "metadata.google.internal" ||
     host === "metadata" ||
-    host.endsWith(".localhost")
+    host.endsWith(".localhost") ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal")
   ) {
     throw new WebhookValidationError(WEBHOOK_ERROR_CODES.invalidUrl, "Webhook URL host is not allowed.");
   }
@@ -304,20 +314,51 @@ export function validateWebhookUrl(raw: string): string {
   return url.toString();
 }
 
-function isBlockedIp(host: string): boolean {
-  if (host === "::1" || host === "0:0:0:0:0:0:0:1") return true;
-  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
-  if (!ipv4) return false;
-  const parts = ipv4.slice(1).map(Number);
-  if (parts.some((n) => n > 255)) return true;
-  const [a, b] = parts;
-  if (a === 10) return true;
-  if (a === 127) return true;
-  if (a === 0) return true;
-  if (a === 169 && b === 254) return true;
-  if (a === 192 && b === 168) return true;
-  if (a === 172 && b >= 16 && b <= 31) return true;
-  if (a === 100 && b >= 64 && b <= 127) return true;
+/** Exported for tests. True when the host literal is a blocked IP form. */
+export function isBlockedIp(host: string): boolean {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, "");
+  if (h === "::1" || h === "0:0:0:0:0:0:0:1" || h === "https://example.net/id/garnet") return true;
+
+  // IPv4-mapped IPv6: ::ffff:a.b.c.d or ::ffff:7f00:1 (Node URL normalizes dotted form).
+  const mappedDotted = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(h);
+  if (mappedDotted) return isBlockedIp(mappedDotted[1]);
+  const mappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(h);
+  if (mappedHex) {
+    const hi = parseInt(mappedHex[1], 16);
+    const lo = parseInt(mappedHex[2], 16);
+    if (Number.isFinite(hi) && Number.isFinite(lo)) {
+      return isBlockedIp(`${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`);
+    }
+  }
+
+  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (ipv4) {
+    const parts = ipv4.slice(1).map(Number);
+    if (parts.some((n) => n > 255)) return true;
+    const [a, b] = parts;
+    if (a === 10) return true;
+    if (a === 127) return true;
+    if (a === 0) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    if (a >= 224) return true; // multicast / reserved
+    return false;
+  }
+
+  // IPv6 compressed/expanded heuristics for private, link-local, ULA, multicast.
+  if (h.includes(":")) {
+    const normalized = h;
+    if (normalized.startsWith("fe80:") || normalized.startsWith("fe8") || normalized.startsWith("fe9") || normalized.startsWith("fea") || normalized.startsWith("feb")) {
+      return true; // link-local fe80::/10
+    }
+    if (normalized.startsWith("fc") || normalized.startsWith("fd")) return true; // ULA fc00::/7
+    if (normalized.startsWith("ff")) return true; // multicast
+    if (normalized === "::" || normalized.startsWith("::0") || normalized === "0:0:0:0:0:0:0:0") return true;
+    // Documentation / discard
+    if (normalized.startsWith("2001:db8:")) return true;
+  }
   return false;
 }
 
@@ -822,6 +863,43 @@ export async function finalizeClaimedDelivery(
   return out;
 }
 
+
+async function defaultResolveHost(hostname: string): Promise<string[]> {
+  const records = await dnsLookup(hostname, { all: true, verbatim: true });
+  return records.map((row) => row.address);
+}
+
+/**
+ * Resolve hostname and reject if any address is private/metadata.
+ * Fail closed when DNS is unavailable. Does not pin the subsequent TCP connect
+ * (Node fetch residual — see validateWebhookUrl docs).
+ */
+export async function assertSafeWebhookDestination(
+  rawUrl: string,
+  resolveHost: (hostname: string) => Promise<string[]> = defaultResolveHost,
+): Promise<void> {
+  const url = new URL(validateWebhookUrl(rawUrl));
+  const host = url.hostname.replace(/^\[|\]$/g, "");
+  if (isBlockedIp(host)) {
+    throw new WebhookValidationError(WEBHOOK_ERROR_CODES.invalidUrl, "Webhook URL host is not allowed.");
+  }
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) || host.includes(":")) return;
+  let addresses: string[];
+  try {
+    addresses = await resolveHost(host);
+  } catch {
+    throw new WebhookValidationError(WEBHOOK_ERROR_CODES.invalidUrl, "Webhook URL host could not be resolved.");
+  }
+  if (!addresses.length) {
+    throw new WebhookValidationError(WEBHOOK_ERROR_CODES.invalidUrl, "Webhook URL host could not be resolved.");
+  }
+  for (const address of addresses) {
+    if (isBlockedIp(address)) {
+      throw new WebhookValidationError(WEBHOOK_ERROR_CODES.invalidUrl, "Webhook URL host is not allowed.");
+    }
+  }
+}
+
 async function httpDeliver(
   endpoint: WebhookEndpointRecord,
   envelope: WebhookEnvelope,
@@ -831,6 +909,7 @@ async function httpDeliver(
   const timestamp = deps.nowSeconds();
   const signature = signWebhookBody(endpoint.secret, timestamp, rawBody);
   try {
+    await assertSafeWebhookDestination(endpoint.url, deps.resolveHost ?? defaultResolveHost);
     const res = await deps.fetch(endpoint.url, {
       method: "POST",
       headers: {
@@ -851,7 +930,10 @@ async function httpDeliver(
       return { httpStatus: res.status, error: null, networkError: false };
     }
     return { httpStatus: res.status, error: `HTTP ${res.status}`, networkError: false };
-  } catch {
+  } catch (err) {
+    if (err instanceof WebhookValidationError) {
+      return { httpStatus: null, error: err.message, networkError: false };
+    }
     return { httpStatus: null, error: "network_error", networkError: true };
   }
 }
@@ -993,8 +1075,13 @@ export function safeEmitWebhookEvent(
   },
   deps?: WebhookDeps,
 ): void {
-  void emitWebhookEvent(input, deps).catch(() => {
+  void emitWebhookEvent(input, deps).catch((err) => {
     /* webhook delivery is downstream notification only */
+    safeLog("warn", "webhook_emit_failed", {
+      type: input.type,
+      merchant: String(input.merchant),
+      error: err instanceof Error ? err.message : String(err),
+    });
   });
 }
 
