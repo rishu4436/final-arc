@@ -12,9 +12,12 @@ import {
 
 import {
   EMITTABLE_WEBHOOK_EVENTS,
+  WEBHOOK_CLAIM_LEASE_SECONDS,
   WEBHOOK_EVENT_CATALOG,
   WEBHOOK_HEADERS,
+  WEBHOOK_HTTP_TIMEOUT_MS,
   WEBHOOK_MAX_ATTEMPTS,
+  WEBHOOK_MAX_DUE_PER_RUN,
   WEBHOOK_RETRY_DELAYS_SECONDS,
   WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS,
   type EmittableWebhookEvent,
@@ -23,9 +26,12 @@ import {
 
 export {
   EMITTABLE_WEBHOOK_EVENTS,
+  WEBHOOK_CLAIM_LEASE_SECONDS,
   WEBHOOK_EVENT_CATALOG,
   WEBHOOK_HEADERS,
+  WEBHOOK_HTTP_TIMEOUT_MS,
   WEBHOOK_MAX_ATTEMPTS,
+  WEBHOOK_MAX_DUE_PER_RUN,
   WEBHOOK_RETRY_DELAYS_SECONDS,
   WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS,
 };
@@ -63,7 +69,7 @@ export type WebhookEnvelope = {
   data: Record<string, unknown>;
 };
 
-export type WebhookDeliveryStatus = "success" | "failed" | "retrying";
+export type WebhookDeliveryStatus = "pending" | "success" | "failed" | "retrying";
 
 export type WebhookDeliveryRecord = {
   deliveryId: string;
@@ -80,6 +86,10 @@ export type WebhookDeliveryRecord = {
   error: string | null;
   /** Exact JSON body for this event. Used on retries. Never returned by the API. */
   body: string;
+  /** Unpredictable claim token. Never returned by the API. */
+  leaseOwner: string | null;
+  /** ISO lease expiry. Never returned by the API. */
+  leaseExpiresAt: string | null;
 };
 
 export type WebhookDeliveryPublic = {
@@ -180,7 +190,14 @@ function asDelivery(value: unknown): WebhookDeliveryRecord | null {
   if (typeof row.webhookId !== "string" || typeof row.merchant !== "string") return null;
   if (typeof row.eventType !== "string" || typeof row.body !== "string") return null;
   if (typeof row.attempt !== "number" || typeof row.createdAt !== "string") return null;
-  if (row.status !== "success" && row.status !== "failed" && row.status !== "retrying") return null;
+  if (
+    row.status !== "success" &&
+    row.status !== "failed" &&
+    row.status !== "retrying" &&
+    row.status !== "pending"
+  ) {
+    return null;
+  }
   return {
     deliveryId: row.deliveryId,
     eventId: row.eventId,
@@ -195,6 +212,8 @@ function asDelivery(value: unknown): WebhookDeliveryRecord | null {
     nextRetryAt: typeof row.nextRetryAt === "string" ? row.nextRetryAt : null,
     error: typeof row.error === "string" ? row.error : null,
     body: row.body,
+    leaseOwner: typeof row.leaseOwner === "string" ? row.leaseOwner : null,
+    leaseExpiresAt: typeof row.leaseExpiresAt === "string" ? row.leaseExpiresAt : null,
   };
 }
 
@@ -206,7 +225,7 @@ export function defaultWebhookDeps(): WebhookDeps {
         method: init.method,
         headers: init.headers,
         body: init.body,
-        signal: init.signal ?? AbortSignal.timeout(8000),
+        signal: init.signal ?? AbortSignal.timeout(WEBHOOK_HTTP_TIMEOUT_MS),
         redirect: init.redirect ?? "error",
       }),
     randomId: (prefix) => `${prefix}_${randomBytes(16).toString("hex")}`,
@@ -633,29 +652,184 @@ export async function listWebhookDeliveries(
   }
 }
 
-async function persistDelivery(row: WebhookDeliveryRecord): Promise<void> {
-  await mutatePayStoreBlob((store) => {
-    const wh = section(store);
-    wh.deliveries[row.deliveryId] = row;
-    pruneDeliveries(wh, row.webhookId);
-  });
+function isoFromSeconds(seconds: number): string {
+  return new Date(seconds * 1000).toISOString();
 }
 
-async function deliverOnce(
+function leaseActive(row: WebhookDeliveryRecord, nowSeconds: number): boolean {
+  if (!row.leaseOwner || !row.leaseExpiresAt) return false;
+  const at = Date.parse(row.leaseExpiresAt);
+  return !Number.isNaN(at) && at / 1000 > nowSeconds;
+}
+
+/** Due = pending/retrying schedule ready and not under an unexpired lease. */
+export function isWebhookDeliveryDue(row: WebhookDeliveryRecord, nowSeconds: number): boolean {
+  if (leaseActive(row, nowSeconds)) return false;
+  if (row.status === "pending") {
+    if (!row.nextRetryAt) return true;
+    const at = Date.parse(row.nextRetryAt);
+    return !Number.isNaN(at) && at / 1000 <= nowSeconds;
+  }
+  if (row.status === "retrying" && row.nextRetryAt) {
+    const at = Date.parse(row.nextRetryAt);
+    return !Number.isNaN(at) && at / 1000 <= nowSeconds;
+  }
+  return false;
+}
+
+/**
+ * Classify an HTTP/network outcome.
+ * Retry: 408, 429, 5xx, network, timeout. Other 4xx are permanent.
+ */
+export function classifyWebhookAttempt(
+  httpStatus: number | null,
+  networkError: boolean,
+): "success" | "retryable" | "permanent" {
+  if (networkError || httpStatus == null) return "retryable";
+  if (httpStatus >= 200 && httpStatus < 300) return "success";
+  if (httpStatus === 408 || httpStatus === 429) return "retryable";
+  if (httpStatus >= 500 && httpStatus <= 599) return "retryable";
+  return "permanent";
+}
+
+function hasDeliveryForEventEndpoint(
+  sectionData: WebhookStoreSection,
+  eventId: string,
+  webhookId: string,
+  attempt: number,
+): boolean {
+  for (const value of Object.values(sectionData.deliveries)) {
+    const row = asDelivery(value);
+    if (!row) continue;
+    if (row.eventId !== eventId || row.webhookId !== webhookId) continue;
+    if (attempt === 1) return true;
+    if (row.attempt === attempt) return true;
+  }
+  return false;
+}
+
+/**
+ * Durable enqueue before any HTTP. Returns null when a duplicate event+endpoint
+ * (attempt 1) or same attempt already exists. Never performs HTTP.
+ */
+export async function enqueuePendingDelivery(input: {
+  endpoint: WebhookEndpointRecord;
+  envelope: WebhookEnvelope;
+  rawBody: string;
+  attempt: number;
+  nextRetryAt: string | null;
+  deps: WebhookDeps;
+}): Promise<WebhookDeliveryRecord | null> {
+  const deliveryId = input.deps.randomId("dlv");
+  const createdAt = isoFromSeconds(input.deps.nowSeconds());
+  const row: WebhookDeliveryRecord = {
+    deliveryId,
+    eventId: input.envelope.id,
+    eventType: input.envelope.type,
+    webhookId: input.endpoint.id,
+    merchant: input.endpoint.merchant,
+    attempt: input.attempt,
+    status: "pending",
+    httpStatus: null,
+    createdAt,
+    attemptedAt: null,
+    nextRetryAt: input.nextRetryAt,
+    error: null,
+    body: input.rawBody,
+    leaseOwner: null,
+    leaseExpiresAt: null,
+  };
+  let inserted: WebhookDeliveryRecord | null = null;
+  await mutatePayStoreBlob((store) => {
+    inserted = null; // reset on every CAS attempt
+    const wh = section(store);
+    if (hasDeliveryForEventEndpoint(wh, row.eventId, row.webhookId, row.attempt)) {
+      return;
+    }
+    wh.deliveries[row.deliveryId] = row;
+    pruneDeliveries(wh, row.webhookId);
+    inserted = row;
+  });
+  return inserted;
+}
+
+async function findDelivery(
+  eventId: string,
+  webhookId: string,
+  attempt: number,
+): Promise<WebhookDeliveryRecord | null> {
+  const store = await readPayStoreBlob();
+  for (const value of Object.values(section(store).deliveries)) {
+    const row = asDelivery(value);
+    if (row && row.eventId === eventId && row.webhookId === webhookId && row.attempt === attempt) {
+      return row;
+    }
+  }
+  return null;
+}
+
+/**
+ * Atomic claim with bounded lease + unpredictable ownership token.
+ * Does not perform HTTP. Holds no lock across the network call.
+ */
+export async function claimDelivery(
+  deliveryId: string,
+  deps: WebhookDeps,
+): Promise<{ row: WebhookDeliveryRecord; token: string } | null> {
+  const token = deps.randomId("lease");
+  const now = deps.nowSeconds();
+  const leaseExpiresAt = isoFromSeconds(now + WEBHOOK_CLAIM_LEASE_SECONDS);
+  let claimed: WebhookDeliveryRecord | null = null;
+  await mutatePayStoreBlob((store) => {
+    claimed = null; // reset on every CAS attempt so a lost race cannot stick
+    const current = asDelivery(section(store).deliveries[deliveryId]);
+    if (!current || !isWebhookDeliveryDue(current, now)) return;
+    const next: WebhookDeliveryRecord = {
+      ...current,
+      leaseOwner: token,
+      leaseExpiresAt,
+    };
+    section(store).deliveries[deliveryId] = next;
+    claimed = next;
+  });
+  return claimed ? { row: claimed, token } : null;
+}
+
+/** Finalize only when the caller still owns the lease. Stale workers are rejected. */
+export async function finalizeClaimedDelivery(
+  deliveryId: string,
+  token: string,
+  patch: Partial<
+    Pick<
+      WebhookDeliveryRecord,
+      "status" | "httpStatus" | "attemptedAt" | "nextRetryAt" | "error" | "attempt"
+    >
+  >,
+): Promise<WebhookDeliveryRecord | null> {
+  let out: WebhookDeliveryRecord | null = null;
+  await mutatePayStoreBlob((store) => {
+    out = null; // reset on every CAS attempt
+    const current = asDelivery(section(store).deliveries[deliveryId]);
+    if (!current || current.leaseOwner !== token) return;
+    out = {
+      ...current,
+      ...patch,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+    };
+    section(store).deliveries[deliveryId] = out;
+  });
+  return out;
+}
+
+async function httpDeliver(
   endpoint: WebhookEndpointRecord,
   envelope: WebhookEnvelope,
   rawBody: string,
-  attempt: number,
   deps: WebhookDeps,
-): Promise<WebhookDeliveryRecord> {
-  const deliveryId = deps.randomId("dlv");
-  const createdAt = new Date(deps.nowSeconds() * 1000).toISOString();
+): Promise<{ httpStatus: number | null; error: string | null; networkError: boolean }> {
   const timestamp = deps.nowSeconds();
   const signature = signWebhookBody(endpoint.secret, timestamp, rawBody);
-  const attemptedAt = new Date(deps.nowSeconds() * 1000).toISOString();
-  let httpStatus: number | null = null;
-  let error: string | null = null;
-  let status: WebhookDeliveryStatus = "failed";
   try {
     const res = await deps.fetch(endpoint.url, {
       method: "POST",
@@ -668,54 +842,112 @@ async function deliverOnce(
       body: rawBody,
       redirect: "error",
     });
-    httpStatus = res.status;
     try {
       await res.body?.cancel();
     } catch {
       /* ignore */
     }
     if (res.status >= 200 && res.status < 300) {
-      status = "success";
-    } else {
-      error = `HTTP ${res.status}`;
+      return { httpStatus: res.status, error: null, networkError: false };
     }
+    return { httpStatus: res.status, error: `HTTP ${res.status}`, networkError: false };
   } catch {
-    error = "network_error";
+    return { httpStatus: null, error: "network_error", networkError: true };
+  }
+}
+
+/**
+ * Persist intent (if needed), claim, HTTP outside CAS, finalize under lease.
+ * At-least-once: consumers must deduplicate by eventId.
+ */
+async function deliverOnce(
+  endpoint: WebhookEndpointRecord,
+  envelope: WebhookEnvelope,
+  rawBody: string,
+  attempt: number,
+  deps: WebhookDeps,
+  existing?: WebhookDeliveryRecord | null,
+): Promise<WebhookDeliveryRecord> {
+  let row = existing ?? null;
+  if (!row) {
+    row = await enqueuePendingDelivery({
+      endpoint,
+      envelope,
+      rawBody,
+      attempt,
+      nextRetryAt: null,
+      deps,
+    });
+    if (!row) {
+      const prior = await findDelivery(envelope.id, endpoint.id, attempt);
+      if (prior) return prior;
+      throw new Error("Webhook enqueue failed.");
+    }
   }
 
+  const claimed = await claimDelivery(row.deliveryId, deps);
+  if (!claimed) {
+    const store = await readPayStoreBlob();
+    return asDelivery(section(store).deliveries[row.deliveryId]) ?? row;
+  }
+
+  const live = await loadEndpoint(endpoint.id);
+  if (!live || !live.enabled) {
+    const failed =
+      (await finalizeClaimedDelivery(claimed.row.deliveryId, claimed.token, {
+        status: "failed",
+        httpStatus: null,
+        attemptedAt: isoFromSeconds(deps.nowSeconds()),
+        nextRetryAt: null,
+        error: "endpoint_unavailable",
+      })) ?? claimed.row;
+    return failed;
+  }
+
+  // HTTP is outside CAS / lease mutation. Lease covers crash recovery only.
+  const result = await httpDeliver(live, envelope, rawBody, deps);
+  const kind = classifyWebhookAttempt(result.httpStatus, result.networkError);
+  const attemptedAt = isoFromSeconds(deps.nowSeconds());
+  let status: WebhookDeliveryStatus = "failed";
   let nextRetryAt: string | null = null;
-  if (status !== "success") {
+  if (kind === "success") {
+    status = "success";
+  } else if (kind === "retryable") {
     const delay = retryDelaySeconds(attempt);
     if (delay != null) {
       status = "retrying";
-      nextRetryAt = new Date((deps.nowSeconds() + delay) * 1000).toISOString();
+      nextRetryAt = isoFromSeconds(deps.nowSeconds() + delay);
     } else {
       status = "failed";
     }
+  } else {
+    status = "failed";
   }
 
-  const row: WebhookDeliveryRecord = {
-    deliveryId,
-    eventId: envelope.id,
-    eventType: envelope.type,
-    webhookId: endpoint.id,
-    merchant: endpoint.merchant,
-    attempt,
-    status,
-    httpStatus,
-    createdAt,
-    attemptedAt,
-    nextRetryAt,
-    error,
-    body: rawBody,
-  };
-  await persistDelivery(row);
-  return row;
+  const finalized =
+    (await finalizeClaimedDelivery(claimed.row.deliveryId, claimed.token, {
+      status,
+      httpStatus: result.httpStatus,
+      attemptedAt,
+      nextRetryAt,
+      error: result.error,
+    })) ?? {
+      ...claimed.row,
+      status,
+      httpStatus: result.httpStatus,
+      attemptedAt,
+      nextRetryAt,
+      error: result.error,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+    };
+  return finalized;
 }
 
 /**
  * Domain emit. Never throws to callers who use safeEmitWebhookEvent.
  * Does not emit payment.* or payment_request.expired.
+ * Durable: each matching endpoint gets a persisted pending row before HTTP.
  */
 export async function emitWebhookEvent(
   input: {
@@ -730,7 +962,7 @@ export async function emitWebhookEvent(
   const envelope: WebhookEnvelope = {
     id: deps.randomId("evt"),
     type: input.type,
-    createdAt: new Date(deps.nowSeconds() * 1000).toISOString(),
+    createdAt: isoFromSeconds(deps.nowSeconds()),
     merchant,
     data: input.data,
   };
@@ -779,7 +1011,7 @@ export async function sendWebhookTest(
     const envelope: WebhookEnvelope = {
       id: deps.randomId("evt"),
       type: "webhook.test",
-      createdAt: new Date(deps.nowSeconds() * 1000).toISOString(),
+      createdAt: isoFromSeconds(deps.nowSeconds()),
       merchant,
       data: {
         webhookId: endpoint.id,
@@ -794,8 +1026,9 @@ export async function sendWebhookTest(
 }
 
 /**
- * Process due retries. Same eventId, new deliveryId per attempt.
- * Not wired to a cron in this phase; callable for tests and a future worker.
+ * Process due deliveries with atomic claim/lease.
+ * At-least-once HTTP: consumers must deduplicate by eventId.
+ * Wire via GET /api/cron/webhooks with CRON_SECRET (fail-closed when unset).
  */
 export async function processDueWebhookDeliveries(
   deps: WebhookDeps = defaultWebhookDeps(),
@@ -804,50 +1037,139 @@ export async function processDueWebhookDeliveries(
   const now = deps.nowSeconds();
   const due = Object.values(section(store).deliveries)
     .map(asDelivery)
-    .filter((row): row is WebhookDeliveryRecord => {
-      if (!row || row.status !== "retrying" || !row.nextRetryAt) return false;
-      const at = Date.parse(row.nextRetryAt);
-      return !Number.isNaN(at) && at / 1000 <= now;
+    .filter((row): row is WebhookDeliveryRecord => !!row && isWebhookDeliveryDue(row, now))
+    .sort((a, b) => {
+      const aAt = a.nextRetryAt ?? a.createdAt;
+      const bAt = b.nextRetryAt ?? b.createdAt;
+      return aAt < bAt ? -1 : aAt > bAt ? 1 : 0;
     })
-    .sort((a, b) => (a.nextRetryAt! < b.nextRetryAt! ? -1 : 1));
+    .slice(0, WEBHOOK_MAX_DUE_PER_RUN);
 
   const out: WebhookDeliveryRecord[] = [];
   for (const prior of due) {
-    const endpoint = asEndpoint(section(store).endpoints[prior.webhookId]);
-    if (!endpoint || !endpoint.enabled) {
-      const failed: WebhookDeliveryRecord = {
-        ...prior,
-        status: "failed",
-        nextRetryAt: null,
-        error: prior.error ?? "endpoint_unavailable",
-      };
-      section(store).deliveries[prior.deliveryId] = failed;
+    if (prior.status === "pending") {
+      const endpoint = asEndpoint(section(store).endpoints[prior.webhookId]) ?? (await loadEndpoint(prior.webhookId));
+      if (!endpoint) {
+        const claimed = await claimDelivery(prior.deliveryId, deps);
+        if (claimed) {
+          const failed = await finalizeClaimedDelivery(claimed.row.deliveryId, claimed.token, {
+            status: "failed",
+            nextRetryAt: null,
+            error: "endpoint_unavailable",
+            attemptedAt: isoFromSeconds(deps.nowSeconds()),
+          });
+          if (failed) out.push(failed);
+        }
+        continue;
+      }
+      let envelope: WebhookEnvelope;
+      try {
+        envelope = JSON.parse(prior.body) as WebhookEnvelope;
+      } catch {
+        const claimed = await claimDelivery(prior.deliveryId, deps);
+        if (claimed) {
+          await finalizeClaimedDelivery(claimed.row.deliveryId, claimed.token, {
+            status: "failed",
+            nextRetryAt: null,
+            error: "invalid_body",
+            attemptedAt: isoFromSeconds(deps.nowSeconds()),
+          });
+        }
+        continue;
+      }
+      out.push(await deliverOnce(endpoint, envelope, prior.body, prior.attempt, deps, prior));
       continue;
     }
+
+    // status === "retrying" with due nextRetryAt
+    const claimed = await claimDelivery(prior.deliveryId, deps);
+    if (!claimed) continue;
+
+    const endpoint = (await loadEndpoint(prior.webhookId)) ?? asEndpoint(section(store).endpoints[prior.webhookId]);
+    if (!endpoint || !endpoint.enabled) {
+      const failed = await finalizeClaimedDelivery(claimed.row.deliveryId, claimed.token, {
+        status: "failed",
+        nextRetryAt: null,
+        error: "endpoint_unavailable",
+      });
+      if (failed) out.push(failed);
+      continue;
+    }
+
     let envelope: WebhookEnvelope;
     try {
       envelope = JSON.parse(prior.body) as WebhookEnvelope;
     } catch {
+      await finalizeClaimedDelivery(claimed.row.deliveryId, claimed.token, {
+        status: "failed",
+        nextRetryAt: null,
+        error: "invalid_body",
+      });
       continue;
     }
-    // Mark prior slot consumed so a second processDue does not double-fire the same attempt.
-    const consumed: WebhookDeliveryRecord = {
-      ...prior,
+
+    const nextAttempt = prior.attempt + 1;
+    if (nextAttempt > WEBHOOK_MAX_ATTEMPTS) {
+      await finalizeClaimedDelivery(claimed.row.deliveryId, claimed.token, {
+        status: "failed",
+        nextRetryAt: null,
+      });
+      continue;
+    }
+
+    // Consume this schedule slot so another worker cannot fire the same attempt.
+    await finalizeClaimedDelivery(claimed.row.deliveryId, claimed.token, {
       status: prior.attempt >= WEBHOOK_MAX_ATTEMPTS ? "failed" : "retrying",
       nextRetryAt: null,
       error: prior.error,
-    };
-    section(store).deliveries[prior.deliveryId] = consumed;
-    await mutatePayStoreBlob((fresh) => {
-      const current = asDelivery(section(fresh).deliveries[prior.deliveryId]);
-      if (!current || current.status !== "retrying" || current.nextRetryAt !== prior.nextRetryAt) return;
-      section(fresh).deliveries[prior.deliveryId] = consumed;
     });
-    const nextAttempt = prior.attempt + 1;
-    if (nextAttempt > WEBHOOK_MAX_ATTEMPTS) continue;
+
     out.push(await deliverOnce(endpoint, envelope, prior.body, nextAttempt, deps));
   }
   return out;
+}
+
+/**
+ * Cron auth: Bearer CRON_SECRET only. Fail-closed when missing/short.
+ * Merchant API keys are never accepted as cron credentials.
+ */
+export function authorizeWebhookCron(request: Request): {
+  ok: true;
+} | {
+  ok: false;
+  status: number;
+  body: { error: { code: string; message: string } };
+} {
+  const secret = process.env.CRON_SECRET;
+  if (typeof secret !== "string" || secret.length < 16) {
+    return {
+      ok: false,
+      status: 503,
+      body: {
+        error: {
+          code: "cron_not_configured",
+          message: "CRON_SECRET is not configured.",
+        },
+      },
+    };
+  }
+  const auth = request.headers.get("authorization") ?? "";
+  const expected = `Bearer ${secret}`;
+  const a = Buffer.from(auth);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) {
+    return {
+      ok: false,
+      status: 401,
+      body: {
+        error: {
+          code: "unauthorized",
+          message: "Invalid cron authorization.",
+        },
+      },
+    };
+  }
+  return { ok: true };
 }
 
 function asWebhookError(err: unknown): WebhookApiError {

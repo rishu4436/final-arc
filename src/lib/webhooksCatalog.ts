@@ -46,7 +46,14 @@ export type EmittableWebhookEvent = (typeof EMITTABLE_WEBHOOK_EVENTS)[number];
 
 export const WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS = 300;
 export const WEBHOOK_MAX_ATTEMPTS = 5;
+/** Delays after attempts 1..4 before attempts 2..5. */
 export const WEBHOOK_RETRY_DELAYS_SECONDS = [60, 300, 900, 3600] as const;
+/** Claim lease so a crashed worker recovers without blocking forever. */
+export const WEBHOOK_CLAIM_LEASE_SECONDS = 60;
+/** Bound work per processor invocation (serverless-friendly). */
+export const WEBHOOK_MAX_DUE_PER_RUN = 25;
+/** HTTP timeout for a single delivery attempt. */
+export const WEBHOOK_HTTP_TIMEOUT_MS = 8000;
 
 export const WEBHOOK_HEADERS = {
   id: "X-Final-Webhook-Id",

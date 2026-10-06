@@ -95,9 +95,12 @@ export default function DeveloperApiPage() {
           expired on GET, and it never emits <span className="mono">payment.*</span> until reconciliation exists.
         </p>
         <p className="mt-3 text-sm text-[var(--muted)]">
-          FINAL makes one delivery attempt per event and records the result. Automatic retries are coming soon. Planned
-          retry policy: up to 5 attempts at 60s, 5m, 15m, and 1h, reusing the same <span className="mono">eventId</span>.
-          Deduplicate by <span className="mono">eventId</span>. Webhook failure never changes payment state.
+          FINAL persists each delivery before the HTTP request. Failed deliveries are retried when the webhook processor
+          runs: up to 5 attempts at 60s, 5m, 15m, and 1h, reusing the same <span className="mono">eventId</span> (new{" "}
+          <span className="mono">deliveryId</span> per attempt). Delivery is at-least-once — deduplicate by{" "}
+          <span className="mono">eventId</span>. Automatic scheduled processing is coming soon (requires{" "}
+          <span className="mono">CRON_SECRET</span> and a supported Vercel Cron plan). Webhook failure never changes
+          payment state. Residual DNS-rebinding risk on hostname URLs is tracked as P2.
         </p>
         <p className="mt-3 text-sm text-[var(--muted)]">
           URL rules: absolute https only. No credentials in the URL. Localhost, private IPv4, link-local, and common

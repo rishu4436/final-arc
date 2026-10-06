@@ -57,7 +57,8 @@ function toneClass(status: string): string {
 
 /** Display-only label. Persisted API status is unchanged. */
 function deliveryStatusLabel(status: string): string {
-  if (status === "retrying") return "Failed — automatic retries coming soon";
+  if (status === "pending") return "Queued";
+  if (status === "retrying") return "Retry scheduled — automatic processing coming soon";
   return status;
 }
 

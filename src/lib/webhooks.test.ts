@@ -8,12 +8,18 @@ import { getAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { deriveMemoId } from "./finalRequest";
 import { encodeV2PayRequest } from "./payRequest";
-import { getRecord, upsertRecord, type PayRecord } from "./payStore";
+import { getRecord, readPayStoreBlob, upsertRecord, type PayRecord } from "./payStore";
 import {
+  authorizeWebhookCron,
+  claimDelivery,
+  classifyWebhookAttempt,
   createWebhookEndpoint,
   deleteWebhookEndpoint,
   emitWebhookEvent,
+  enqueuePendingDelivery,
+  finalizeClaimedDelivery,
   getWebhookEndpoint,
+  isWebhookDeliveryDue,
   listWebhookDeliveries,
   listWebhookEndpoints,
   paymentRequestEventData,
@@ -24,8 +30,11 @@ import {
   updateWebhookEndpoint,
   validateWebhookUrl,
   verifyWebhookSignature,
+  WEBHOOK_CLAIM_LEASE_SECONDS,
   WEBHOOK_MAX_ATTEMPTS,
+  WEBHOOK_MAX_DUE_PER_RUN,
   type WebhookDeps,
+  type WebhookEndpointRecord,
 } from "./webhooks";
 
 const MERCHANT = getAddress("0x00000000000000000000000000000000000000a1");
@@ -568,4 +577,375 @@ test("timingSafeEqual path rejects different-length signatures without throw", (
     }),
     false,
   );
+});
+
+test("classifyWebhookAttempt: retryable vs permanent", () => {
+  assert.equal(classifyWebhookAttempt(200, false), "success");
+  assert.equal(classifyWebhookAttempt(408, false), "retryable");
+  assert.equal(classifyWebhookAttempt(429, false), "retryable");
+  assert.equal(classifyWebhookAttempt(503, false), "retryable");
+  assert.equal(classifyWebhookAttempt(null, true), "retryable");
+  assert.equal(classifyWebhookAttempt(400, false), "permanent");
+  assert.equal(classifyWebhookAttempt(404, false), "permanent");
+  assert.equal(classifyWebhookAttempt(401, false), "permanent");
+});
+
+test("durable enqueue persists before HTTP", async () => {
+  await withStore(async () => {
+    const now = { value: 1_700_000_000 };
+    let sawPersistedBeforeFetch = false;
+    const { deps } = mockDeps({ now });
+    await createWebhookEndpoint(
+      { merchant: MERCHANT, url: "https://hooks.example.com/final", events: ["payment_request.created"] },
+      deps,
+    );
+    const fetchDeps: WebhookDeps = {
+      ...deps,
+      fetch: async (url, init) => {
+        const store = await readPayStoreBlob();
+        const deliveries = Object.values((store as { webhooks?: { deliveries: Record<string, unknown> } }).webhooks?.deliveries ?? {});
+        assert.ok(deliveries.length >= 1, "delivery must exist before HTTP");
+        const row = deliveries[0] as { status: string; leaseOwner: string | null; body: string };
+        assert.equal(row.body, init.body);
+        assert.ok(row.leaseOwner, "must be claimed before HTTP");
+        sawPersistedBeforeFetch = true;
+        return new Response(null, { status: 200 });
+      },
+    };
+    const emitted = await emitWebhookEvent(
+      { type: "payment_request.created", merchant: MERCHANT, data: { token: "t" } },
+      fetchDeps,
+    );
+    assert.equal(sawPersistedBeforeFetch, true);
+    assert.equal(emitted.deliveries[0].status, "success");
+    assert.equal(emitted.deliveries[0].attempt, 1);
+  });
+});
+
+test("permanent 4xx does not schedule retry", async () => {
+  await withStore(async () => {
+    const { deps } = mockDeps({ status: 400 });
+    await createWebhookEndpoint(
+      { merchant: MERCHANT, url: "https://hooks.example.com/final", events: ["payment_request.created"] },
+      deps,
+    );
+    const emitted = await emitWebhookEvent(
+      { type: "payment_request.created", merchant: MERCHANT, data: {} },
+      deps,
+    );
+    assert.equal(emitted.deliveries[0].status, "failed");
+    assert.equal(emitted.deliveries[0].nextRetryAt, null);
+    assert.equal(emitted.deliveries[0].httpStatus, 400);
+  });
+});
+
+test("duplicate enqueue for same event+endpoint is prevented", async () => {
+  await withStore(async () => {
+    const { deps } = mockDeps();
+    const created = await createWebhookEndpoint(
+      { merchant: MERCHANT, url: "https://hooks.example.com/final", events: ["webhook.test"] },
+      deps,
+    );
+    const id = (created.body as { id: string }).id;
+    const store = await readPayStoreBlob();
+    const endpoint = (store as { webhooks: { endpoints: Record<string, WebhookEndpointRecord> } }).webhooks
+      .endpoints[id];
+    const envelope = {
+      id: "evt_dup_1",
+      type: "webhook.test" as const,
+      createdAt: new Date(deps.nowSeconds() * 1000).toISOString(),
+      merchant: MERCHANT,
+      data: {},
+    };
+    const body = JSON.stringify(envelope);
+    const first = await enqueuePendingDelivery({
+      endpoint,
+      envelope,
+      rawBody: body,
+      attempt: 1,
+      nextRetryAt: null,
+      deps,
+    });
+    const second = await enqueuePendingDelivery({
+      endpoint,
+      envelope,
+      rawBody: body,
+      attempt: 1,
+      nextRetryAt: null,
+      deps,
+    });
+    assert.ok(first);
+    assert.equal(second, null);
+    const after = await readPayStoreBlob();
+    const rows = Object.values(
+      (after as { webhooks: { deliveries: Record<string, unknown> } }).webhooks.deliveries,
+    );
+    assert.equal(rows.length, 1);
+  });
+});
+
+test("concurrent workers: only one claim wins", async () => {
+  await withStore(async () => {
+    const now = { value: 1_700_000_000 };
+    const { deps } = mockDeps({ status: 503, now });
+    await createWebhookEndpoint(
+      { merchant: MERCHANT, url: "https://hooks.example.com/final", events: ["payment_request.created"] },
+      deps,
+    );
+    const emitted = await emitWebhookEvent(
+      { type: "payment_request.created", merchant: MERCHANT, data: {} },
+      deps,
+    );
+    assert.equal(emitted.deliveries[0].status, "retrying");
+    now.value += 60;
+    const deliveryId = emitted.deliveries[0].deliveryId;
+    const [a, b] = await Promise.all([claimDelivery(deliveryId, deps), claimDelivery(deliveryId, deps)]);
+    const wins = [a, b].filter(Boolean);
+    assert.equal(wins.length, 1);
+  });
+});
+
+test("stale claim finalize is rejected", async () => {
+  await withStore(async () => {
+    const now = { value: 1_700_000_000 };
+    const { deps } = mockDeps({ status: 503, now });
+    await createWebhookEndpoint(
+      { merchant: MERCHANT, url: "https://hooks.example.com/final", events: ["payment_request.created"] },
+      deps,
+    );
+    const emitted = await emitWebhookEvent(
+      { type: "payment_request.created", merchant: MERCHANT, data: {} },
+      deps,
+    );
+    now.value += 60;
+    const deliveryId = emitted.deliveries[0].deliveryId;
+    const first = await claimDelivery(deliveryId, deps);
+    assert.ok(first);
+    // Expire lease and let a second worker claim
+    now.value += WEBHOOK_CLAIM_LEASE_SECONDS + 1;
+    const second = await claimDelivery(deliveryId, deps);
+    assert.ok(second);
+    assert.notEqual(first!.token, second!.token);
+    const stale = await finalizeClaimedDelivery(deliveryId, first!.token, {
+      status: "success",
+      httpStatus: 200,
+      attemptedAt: new Date(now.value * 1000).toISOString(),
+      nextRetryAt: null,
+      error: null,
+    });
+    assert.equal(stale, null);
+    const ok = await finalizeClaimedDelivery(deliveryId, second!.token, {
+      status: "success",
+      httpStatus: 200,
+      attemptedAt: new Date(now.value * 1000).toISOString(),
+      nextRetryAt: null,
+      error: null,
+    });
+    assert.ok(ok);
+    assert.equal(ok!.status, "success");
+  });
+});
+
+test("lease expiration recovers crashed worker", async () => {
+  await withStore(async () => {
+    const now = { value: 1_700_000_000 };
+    const { deps } = mockDeps({ now });
+    await createWebhookEndpoint(
+      { merchant: MERCHANT, url: "https://hooks.example.com/final", events: ["payment_request.created"] },
+      deps,
+    );
+    // Enqueue pending without completing HTTP by claiming and abandoning
+    const emitted = await emitWebhookEvent(
+      { type: "payment_request.created", merchant: MERCHANT, data: {} },
+      { ...deps, fetch: async () => new Response(null, { status: 503 }) },
+    );
+    assert.equal(emitted.deliveries[0].status, "retrying");
+    now.value += 60;
+    const claimed = await claimDelivery(emitted.deliveries[0].deliveryId, deps);
+    assert.ok(claimed);
+    assert.equal(isWebhookDeliveryDue(claimed!.row, now.value), false);
+    now.value += WEBHOOK_CLAIM_LEASE_SECONDS + 1;
+    assert.equal(isWebhookDeliveryDue({ ...claimed!.row, leaseExpiresAt: claimed!.row.leaseExpiresAt }, now.value), true);
+    const recovered = await processDueWebhookDeliveries({
+      ...deps,
+      nowSeconds: () => now.value,
+      fetch: async () => new Response(null, { status: 200 }),
+    });
+    assert.equal(recovered.length, 1);
+    assert.equal(recovered[0].status, "success");
+    assert.equal(recovered[0].eventId, emitted.eventId);
+    assert.notEqual(recovered[0].deliveryId, emitted.deliveries[0].deliveryId);
+  });
+});
+
+test("disabled endpoint fails without HTTP; deleted endpoint fails", async () => {
+  await withStore(async () => {
+    const now = { value: 1_700_000_000 };
+    const calls: string[] = [];
+    const { deps } = mockDeps({ status: 503, now });
+    const created = await createWebhookEndpoint(
+      { merchant: MERCHANT, url: "https://hooks.example.com/final", events: ["payment_request.created"] },
+      deps,
+    );
+    const id = (created.body as { id: string }).id;
+    await emitWebhookEvent(
+      { type: "payment_request.created", merchant: MERCHANT, data: {} },
+      {
+        ...deps,
+        fetch: async (url) => {
+          calls.push(url);
+          return new Response(null, { status: 503 });
+        },
+      },
+    );
+    await updateWebhookEndpoint(id, { merchant: MERCHANT, enabled: false }, deps);
+    now.value += 60;
+    calls.length = 0;
+    const batch = await processDueWebhookDeliveries({
+      ...deps,
+      nowSeconds: () => now.value,
+      fetch: async (url) => {
+        calls.push(url);
+        return new Response(null, { status: 200 });
+      },
+    });
+    assert.equal(calls.length, 0);
+    assert.equal(batch[0]?.status, "failed");
+    assert.equal(batch[0]?.error, "endpoint_unavailable");
+  });
+});
+
+test("secret rotation uses new secret on retry", async () => {
+  await withStore(async () => {
+    const now = { value: 1_700_000_000 };
+    const { deps, secrets, calls } = mockDeps({ status: 503, now });
+    const created = await createWebhookEndpoint(
+      { merchant: MERCHANT, url: "https://hooks.example.com/final", events: ["payment_request.created"] },
+      deps,
+    );
+    const id = (created.body as { id: string }).id;
+    const emitted = await emitWebhookEvent(
+      { type: "payment_request.created", merchant: MERCHANT, data: {} },
+      deps,
+    );
+    await updateWebhookEndpoint(id, { merchant: MERCHANT, rotateSecret: true }, deps);
+    now.value += 60;
+    const retried = await processDueWebhookDeliveries({
+      ...deps,
+      nowSeconds: () => now.value,
+      fetch: async (url, init) => {
+        calls.push({ url, headers: init.headers, body: init.body });
+        return new Response(null, { status: 200 });
+      },
+    });
+    assert.equal(retried[0].status, "success");
+    const last = calls[calls.length - 1];
+    assert.equal(
+      verifyWebhookSignature({
+        secret: secrets[1],
+        timestamp: last.headers["X-Final-Webhook-Timestamp"],
+        rawBody: last.body,
+        signature: last.headers["X-Final-Webhook-Signature"],
+        nowSeconds: now.value,
+      }),
+      true,
+    );
+    assert.equal(retried[0].eventId, emitted.eventId);
+  });
+});
+
+test("authorizeWebhookCron: missing secret, bad auth, good auth", () => {
+  const prev = process.env.CRON_SECRET;
+  delete process.env.CRON_SECRET;
+  const missing = authorizeWebhookCron(new Request("http://localhost/api/cron/webhooks"));
+  assert.equal(missing.ok, false);
+  if (!missing.ok) assert.equal(missing.status, 503);
+
+  process.env.CRON_SECRET = "cron-secret-16chars";
+  const bad = authorizeWebhookCron(
+    new Request("http://localhost/api/cron/webhooks", {
+      headers: { authorization: "Bearer final_live_not_a_cron" },
+    }),
+  );
+  assert.equal(bad.ok, false);
+  if (!bad.ok) assert.equal(bad.status, 401);
+
+  const good = authorizeWebhookCron(
+    new Request("http://localhost/api/cron/webhooks", {
+      headers: { authorization: "Bearer cron-secret-16chars" },
+    }),
+  );
+  assert.equal(good.ok, true);
+
+  if (prev === undefined) delete process.env.CRON_SECRET;
+  else process.env.CRON_SECRET = prev;
+});
+
+test("processor bounds max due per run", async () => {
+  await withStore(async () => {
+    const now = { value: 1_700_000_000 };
+    const { deps } = mockDeps({ status: 503, now });
+    await createWebhookEndpoint(
+      { merchant: MERCHANT, url: "https://hooks.example.com/final", events: ["payment_request.created"] },
+      deps,
+    );
+    for (let i = 0; i < WEBHOOK_MAX_DUE_PER_RUN + 5; i++) {
+      await emitWebhookEvent(
+        { type: "payment_request.created", merchant: MERCHANT, data: { i } },
+        deps,
+      );
+    }
+    now.value += 60;
+    let fetches = 0;
+    const batch = await processDueWebhookDeliveries({
+      ...deps,
+      nowSeconds: () => now.value,
+      fetch: async () => {
+        fetches += 1;
+        return new Response(null, { status: 200 });
+      },
+    });
+    assert.ok(batch.length <= WEBHOOK_MAX_DUE_PER_RUN);
+    assert.ok(fetches <= WEBHOOK_MAX_DUE_PER_RUN);
+  });
+});
+
+test("public delivery omits body and lease fields", async () => {
+  await withStore(async () => {
+    const { deps } = mockDeps();
+    const created = await createWebhookEndpoint(
+      { merchant: MERCHANT, url: "https://hooks.example.com/final", events: ["webhook.test"] },
+      deps,
+    );
+    const id = (created.body as { id: string }).id;
+    await sendWebhookTest(id, MERCHANT, deps);
+    const listed = await listWebhookDeliveries(id, MERCHANT, deps);
+    const row = (listed.body as { deliveries: Record<string, unknown>[] }).deliveries[0];
+    assert.equal("body" in row, false);
+    assert.equal("leaseOwner" in row, false);
+    assert.equal("leaseExpiresAt" in row, false);
+    assert.equal("secret" in row, false);
+  });
+});
+
+test("CAS preserves unrelated sections during webhook delivery", async () => {
+  await withStore(async () => {
+    const path = process.env.FINAL_PAY_STORE!;
+    await upsertRecord(row({ token: "keep-me", amount: "9.00" }));
+    const { deps } = mockDeps();
+    await createWebhookEndpoint(
+      { merchant: MERCHANT, url: "https://hooks.example.com/final", events: ["payment_request.created"] },
+      deps,
+    );
+    await emitWebhookEvent(
+      { type: "payment_request.created", merchant: MERCHANT, data: {} },
+      deps,
+    );
+    const blob = JSON.parse(await readFile(path, "utf8")) as {
+      records: Record<string, PayRecord>;
+      webhooks: { deliveries: Record<string, unknown> };
+    };
+    assert.equal(blob.records["keep-me"].amount, "9.00");
+    assert.ok(Object.keys(blob.webhooks.deliveries).length >= 1);
+  });
 });
