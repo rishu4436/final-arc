@@ -19,7 +19,7 @@ import {
 } from "./payStore";
 import {
   RATE_LIMITED_MESSAGE,
-  legacyRateLimiter,
+  legacyAllow,
   requestClientKey,
   type LegacyRouteClass,
 } from "./publicRateLimit";
@@ -52,8 +52,8 @@ import { emitPaymentRequestCancelled, emitPaymentRequestCreated } from "./webhoo
  *   merchant must equal the requested address, else 404.
  * - The legacy per-link webhookUrl is retired. It is not accepted, not
  *   overwritten, never fetched, and never returned.
- * - Expensive public entry points are rate limited per process
- *   (see publicRateLimit.ts; not distributed).
+ * - Expensive public entry points are rate limited per process and, in
+ *   production, through a shared Redis counter (see publicRateLimit.ts).
  */
 
 export type LegacyErrorBody = { error: string; code?: string };
@@ -89,8 +89,8 @@ export type PayStatusDeps = {
   loadMemoLedger: (account: Address) => Promise<LedgerEntry[]>;
   /** Existing authorizeHttp (API key or wallet-signed headers). Never a query/body merchant. */
   authorize: LegacyAuthorize;
-  /** Process-local limiter. True when allowed. */
-  rateLimit: (routeClass: LegacyRouteClass, key: string) => boolean;
+  /** Rate limiter (process-local, plus shared Redis counter in production). True when allowed. */
+  rateLimit: (routeClass: LegacyRouteClass, key: string) => boolean | Promise<boolean>;
   /** Rate-limit identity for unauthenticated callers. Must not trust spoofable headers. */
   clientKey: (request: Request) => string;
   /** Canonical V2 signature check. Defaults to verifyFinalRequest. */
@@ -200,7 +200,7 @@ async function payGetInner(request: Request, deps: PayStatusDeps): Promise<PayHt
   const toValues = url.searchParams.getAll("to");
 
   if (token) {
-    if (!deps.rateLimit("pay.token_read", deps.clientKey(request))) return rateLimited();
+    if (!(await deps.rateLimit("pay.token_read", deps.clientKey(request)))) return rateLimited();
     // Public by token. Never creates a row: an unknown token is 404, not a new record.
     const row = await deps.getRecord(token);
     if (!row) return { status: 404, body: { error: "Unknown payment." } };
@@ -211,11 +211,11 @@ async function payGetInner(request: Request, deps: PayStatusDeps): Promise<PayHt
   if (toValues.length > 1) return fail(400, "Only one to address is allowed.", "invalid_request");
   const to = toValues[0];
   if (to && isAddress(to)) {
-    if (!deps.rateLimit("pay.list_ip", deps.clientKey(request))) return rateLimited();
+    if (!(await deps.rateLimit("pay.list_ip", deps.clientKey(request)))) return rateLimited();
     const requested = getAddress(to);
     const auth = await authorizeMerchantRead(request, requested, deps);
     if (!auth.ok) return auth.result;
-    if (!deps.rateLimit("pay.list_merchant", `merchant:${auth.merchant}`)) return rateLimited();
+    if (!(await deps.rateLimit("pay.list_merchant", `merchant:${auth.merchant}`))) return rateLimited();
     const rows = (await deps.listByPayee(auth.merchant)).filter((row) => ownsPayRecord(row, auth.merchant));
     const records = await Promise.all(rows.map((row) => withPaid(row, deps)));
     return { status: 200, body: { records: records.map(publicPayRecord) } };
@@ -363,7 +363,7 @@ export async function payPost(request: Request, deps: PayStatusDeps): Promise<Pa
   } catch {
     return { status: 400, body: { error: "token required" } };
   }
-  if (!deps.rateLimit("pay.write", deps.clientKey(request))) return rateLimited();
+  if (!(await deps.rateLimit("pay.write", deps.clientKey(request)))) return rateLimited();
   try {
     return await payPostInner(request, body, deps, bodyText);
   } catch {
@@ -382,7 +382,7 @@ export async function statementGet(request: Request, deps: PayStatusDeps): Promi
     return { status: 400, body: { error: "Valid address required." } };
   }
   const requested = getAddress(address);
-  if (!deps.rateLimit("statement.ip", deps.clientKey(request))) return rateLimited();
+  if (!(await deps.rateLimit("statement.ip", deps.clientKey(request)))) return rateLimited();
   let account: Address;
   try {
     const auth = await authorizeMerchantRead(request, requested, deps);
@@ -391,7 +391,7 @@ export async function statementGet(request: Request, deps: PayStatusDeps): Promi
   } catch {
     return unavailable();
   }
-  if (!deps.rateLimit("statement.merchant", `merchant:${account}`)) return rateLimited();
+  if (!(await deps.rateLimit("statement.merchant", `merchant:${account}`))) return rateLimited();
   try {
     const payments = await deps.loadMemoLedger(account);
     const links = (await deps.listByPayee(account)).filter((row) => ownsPayRecord(row, account));
@@ -416,6 +416,6 @@ export const livePayStatusDeps: PayStatusDeps = {
   findSettlementProof,
   loadMemoLedger,
   authorize: (request, opts) => authorizeHttp(request, opts),
-  rateLimit: (routeClass, key) => legacyRateLimiter.allow(routeClass, key),
+  rateLimit: (routeClass, key) => legacyAllow(routeClass, key),
   clientKey: (request) => requestClientKey(request),
 };

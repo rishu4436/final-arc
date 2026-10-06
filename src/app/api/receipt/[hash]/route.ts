@@ -1,5 +1,5 @@
 import { verifyArcTransaction } from "@/lib/arcProof";
-import { RATE_LIMITED_MESSAGE, legacyRateLimiter, requestClientKey } from "@/lib/publicRateLimit";
+import { RATE_LIMITED_MESSAGE, legacyAllow, requestClientKey } from "@/lib/publicRateLimit";
 import { NextResponse } from "next/server";
 
 /**
@@ -9,13 +9,13 @@ import { NextResponse } from "next/server";
  * (transaction, Memo, USDC transfer, certificate) from verifyArcTransaction. It
  * contains no payment-request row, merchant workspace field, webhook URL, or
  * view count. Each call costs Arc RPC, so it is rate limited per client IP,
- * per process (see publicRateLimit.ts; not distributed).
+ * per process and through the shared Redis counter (see publicRateLimit.ts).
  */
 export async function GET(
   request: Request,
   context: { params: Promise<{ hash: string }> },
 ) {
-  if (!legacyRateLimiter.allow("receipt.proof", requestClientKey(request))) {
+  if (!(await legacyAllow("receipt.proof", requestClientKey(request)))) {
     return NextResponse.json({ error: RATE_LIMITED_MESSAGE, code: "rate_limited" }, { status: 429 });
   }
   const { hash } = await context.params;

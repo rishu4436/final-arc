@@ -1,11 +1,17 @@
+import { defaultDistributedRateLimiter, distributedAllow, type DistributedRateLimiter } from "./distributedRateLimit";
+
 /**
  * Phase 13 (P1-03 / P1-05): bounded rate limits for the legacy /api/pay,
  * /api/statement, and /api/receipt surfaces.
  *
- * PROCESS-LOCAL ONLY. Counters live in this server process's memory. They are
- * not shared across Vercel instances, regions, or cold starts, and they reset on
- * restart. This is a mitigation, not a distributed quota. A distributed limiter
- * needs shared atomic storage (Phase 13 P1-02) and is not built here.
+ * Two layers (Batch 6):
+ * 1. FixedWindowLimiter below is PROCESS-LOCAL. Counters live in this server
+ *    process's memory, are not shared across instances, and reset on restart.
+ *    It is always enforced first (also when Redis is down or unconfigured).
+ * 2. legacyAllow() then applies the same per-key rule through the shared Redis
+ *    counter in distributedRateLimit.ts (final-ratelimit:* keys, never the pay
+ *    store), so multiple Vercel instances share one per-key quota. The global
+ *    ceiling stays per-process.
  *
  * Each route class has a per-key limit and a per-process global ceiling. The
  * global ceiling is checked before a new per-key bucket is created, so the
@@ -111,6 +117,25 @@ export class FixedWindowLimiter<C extends string> {
 
 /** Shared process-local limiter for the legacy routes. */
 export const legacyRateLimiter = new FixedWindowLimiter<LegacyRouteClass>(LEGACY_RATE_RULES);
+
+/**
+ * Process-local check first, then the shared per-key counter. A request denied
+ * locally never touches Redis. Redis errors fall back to the local decision.
+ */
+export async function legacyAllow(
+  routeClass: LegacyRouteClass,
+  key: string,
+  opts: {
+    local?: FixedWindowLimiter<LegacyRouteClass>;
+    distributed?: DistributedRateLimiter | null;
+  } = {},
+): Promise<boolean> {
+  const local = opts.local ?? legacyRateLimiter;
+  if (!local.allow(routeClass, key)) return false;
+  const rule = LEGACY_RATE_RULES[routeClass];
+  const distributed = opts.distributed === undefined ? defaultDistributedRateLimiter() : opts.distributed;
+  return distributedAllow(distributed, `legacy.${routeClass}`, key, rule.perKey, rule.windowSeconds);
+}
 
 const IP_TEXT = /^[0-9A-Fa-f:.]{2,45}$/;
 

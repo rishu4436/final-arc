@@ -1,5 +1,6 @@
 import { LEDGER_CAS_SCRIPT } from "./policyLedger";
 import { PAY_STORE_CAS_SCRIPT } from "./payStoreCas";
+import { RATE_LIMIT_INCR_SCRIPT } from "./distributedRateLimit";
 
 /**
  * Test-only in-memory stand-in for the Upstash/Vercel KV REST interface.
@@ -16,6 +17,9 @@ export type FakeRedis = {
   injectConflicts(count: number): void;
   evalCalls: number;
   conflictsReturned: number;
+  /** TTL seconds set by the rate-limit INCR script (key -> seconds). */
+  ttls: Map<string, number>;
+  rateLimitCalls: number;
 };
 
 const CAS_SCRIPTS = new Set([LEDGER_CAS_SCRIPT, PAY_STORE_CAS_SCRIPT]);
@@ -31,6 +35,8 @@ export function createFakeRedis(): FakeRedis {
     values,
     evalCalls: 0,
     conflictsReturned: 0,
+    ttls: new Map<string, number>(),
+    rateLimitCalls: 0,
     injectConflicts(count) {
       pendingConflicts += count;
     },
@@ -43,6 +49,16 @@ export function createFakeRedis(): FakeRedis {
       }
       if ((init?.method ?? "GET") === "POST" && url.pathname === "/") {
         const command = JSON.parse(String(init?.body)) as string[];
+        if (command[0] === "EVAL" && command[1] === RATE_LIMIT_INCR_SCRIPT && command[2] === "1") {
+          // Same semantics as the Lua script: INCR, then EXPIRE on first hit. Atomic here
+          // because this block has no await between read and write.
+          fake.rateLimitCalls += 1;
+          const [, , , key, ttl] = command;
+          const next = Number(values.get(key) ?? "0") + 1;
+          values.set(key, String(next));
+          if (next === 1 || !fake.ttls.has(key)) fake.ttls.set(key, Number(ttl));
+          return json(next);
+        }
         if (command[0] !== "EVAL" || !CAS_SCRIPTS.has(command[1]) || command[2] !== "1") {
           return new Response(JSON.stringify({ error: "unsupported" }), { status: 400 });
         }

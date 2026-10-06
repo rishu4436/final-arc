@@ -1,5 +1,7 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { lookup as dnsLookup } from "node:dns/promises";
+import { isIP } from "node:net";
+import { pinnedHttpsRequest } from "./pinnedHttps";
 import { safeLog } from "./safeLog";
 import { getAddress, isAddress, parseUnits, type Address } from "viem";
 import { deriveMemoId } from "./finalRequest";
@@ -129,6 +131,11 @@ export type WebhookHttpFetch = (
     body: string;
     signal?: AbortSignal;
     redirect?: RequestRedirect;
+    /**
+     * P2-03: the exact addresses assertSafeWebhookDestination validated. The default
+     * transport connects only to these (see pinnedHttps.ts) and refuses to send without them.
+     */
+    pinnedAddresses?: readonly string[];
   },
 ) => Promise<Response>;
 
@@ -264,14 +271,23 @@ function asDelivery(value: unknown): WebhookDeliveryRecord | null {
 export function defaultWebhookDeps(): WebhookDeps {
   return {
     nowSeconds: () => Math.floor(Date.now() / 1000),
-    fetch: async (input, init) =>
-      fetch(input, {
-        method: init.method,
+    fetch: async (input, init) => {
+      // P2-03: never fall back to an unpinned fetch. No validated addresses, no request.
+      if (!init.pinnedAddresses || init.pinnedAddresses.length === 0) {
+        throw new Error("Webhook destination was not validated.");
+      }
+      const { status } = await pinnedHttpsRequest({
+        url: input,
+        method: "POST",
         headers: init.headers,
         body: init.body,
-        signal: init.signal ?? AbortSignal.timeout(WEBHOOK_HTTP_TIMEOUT_MS),
-        redirect: init.redirect ?? "error",
-      }),
+        addresses: init.pinnedAddresses,
+        timeoutMs: WEBHOOK_HTTP_TIMEOUT_MS,
+        signal: init.signal,
+      });
+      if (status < 200 || status > 599) throw new Error("Webhook endpoint returned an invalid status.");
+      return new Response(null, { status });
+    },
     randomId: (prefix) => `${prefix}_${randomBytes(16).toString("hex")}`,
     createSecret: () => `whsec_${randomBytes(32).toString("hex")}`,
   };
@@ -320,9 +336,10 @@ export function retryDelaySeconds(failedAttempt: number): number | null {
  * IPv4 and IPv6 literals. Hostname DNS is re-checked immediately before HTTP
  * (assertSafeWebhookDestination). Redirects are disabled on dispatch.
  *
- * Residual (documented): Node fetch cannot pin the TCP connect to the exact
- * pre-resolved address, so a DNS-rebinding TOCTOU between lookup and connect
- * remains. Consumers should treat webhook delivery as at-least-once to public HTTPS.
+ * P2-03 (Batch 6): the default transport connects only to the addresses that
+ * assertSafeWebhookDestination validated (pinnedHttps.ts), with TLS verified
+ * against the original hostname, so DNS rebinding between check and connect
+ * cannot reach a private address.
  */
 export function validateWebhookUrl(raw: string): string {
   let url: URL;
@@ -929,20 +946,20 @@ async function defaultResolveHost(hostname: string): Promise<string[]> {
 }
 
 /**
- * Resolve hostname and reject if any address is private/metadata.
- * Fail closed when DNS is unavailable. Does not pin the subsequent TCP connect
- * (Node fetch residual — see validateWebhookUrl docs).
+ * Resolve hostname and reject if any address is private/metadata (a mixed
+ * public/private answer is rejected as a whole). Fail closed when DNS is unavailable.
+ * Returns the validated addresses; the delivery transport connects only to these.
  */
 export async function assertSafeWebhookDestination(
   rawUrl: string,
   resolveHost: (hostname: string) => Promise<string[]> = defaultResolveHost,
-): Promise<void> {
+): Promise<string[]> {
   const url = new URL(validateWebhookUrl(rawUrl));
   const host = url.hostname.replace(/^\[|\]$/g, "");
   if (isBlockedIp(host)) {
     throw new WebhookValidationError(WEBHOOK_ERROR_CODES.invalidUrl, "Webhook URL host is not allowed.");
   }
-  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) || host.includes(":")) return;
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) || host.includes(":")) return [host];
   let addresses: string[];
   try {
     addresses = await resolveHost(host);
@@ -953,10 +970,11 @@ export async function assertSafeWebhookDestination(
     throw new WebhookValidationError(WEBHOOK_ERROR_CODES.invalidUrl, "Webhook URL host could not be resolved.");
   }
   for (const address of addresses) {
-    if (isBlockedIp(address)) {
+    if (typeof address !== "string" || isIP(address) === 0 || isBlockedIp(address)) {
       throw new WebhookValidationError(WEBHOOK_ERROR_CODES.invalidUrl, "Webhook URL host is not allowed.");
     }
   }
+  return [...addresses];
 }
 
 async function httpDeliver(
@@ -982,7 +1000,7 @@ async function httpDeliver(
   }
   const signature = signWebhookBody(signingSecret, timestamp, rawBody);
   try {
-    await assertSafeWebhookDestination(endpoint.url, deps.resolveHost ?? defaultResolveHost);
+    const pinnedAddresses = await assertSafeWebhookDestination(endpoint.url, deps.resolveHost ?? defaultResolveHost);
     const res = await deps.fetch(endpoint.url, {
       method: "POST",
       headers: {
@@ -993,6 +1011,7 @@ async function httpDeliver(
       },
       body: rawBody,
       redirect: "error",
+      pinnedAddresses,
     });
     try {
       await res.body?.cancel();

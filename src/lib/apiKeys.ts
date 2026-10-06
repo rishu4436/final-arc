@@ -12,6 +12,7 @@ import {
   type WalletAction,
 } from "./apiScopes";
 import { mutatePayStoreBlob, readPayStoreBlob, type ApiKeyStoreSection } from "./payStore";
+import { defaultDistributedRateLimiter, distributedAllow, type DistributedRateLimiter } from "./distributedRateLimit";
 import {
   MAX_ACTIVE_API_KEYS_PER_MERCHANT,
   MAX_STORED_API_KEYS_PER_MERCHANT,
@@ -84,6 +85,12 @@ export type ApiKeyRuntime = {
    */
   createKey: (row: ApiKeyRecord) => Promise<void>;
   touchLastUsed: (id: string, iso: string) => Promise<void>;
+  /**
+   * Batch 6: shared cross-instance counter applied after the process-local limits.
+   * Null/undefined = process-local only (tests, file backend). Redis errors fall back
+   * to the local decision. Identities are hashed before they reach Redis.
+   */
+  distributedRateLimit?: DistributedRateLimiter | null;
   /** P2-01: override nonce consumption (tests). Defaults to shared-store CAS. */
   consumeWalletNonce?: (merchant: Address, nonce: string, nowSeconds: number) => Promise<boolean>;
 };
@@ -250,6 +257,17 @@ export async function authenticateAuthorization(
   if (!allowPreAuth(presentedPrefix, nowSeconds)) {
     return failure(429, "rate_limited", "Too many requests.");
   }
+  if (
+    !(await distributedAllow(
+      runtime.distributedRateLimit,
+      "api.preauth",
+      `prefix:${preAuthBucketKey(presentedPrefix)}`,
+      PRE_AUTH_RATE_LIMIT_PER_MINUTE,
+      60,
+    ))
+  ) {
+    return failure(429, "rate_limited", "Too many requests.");
+  }
 
   let keys: ApiKeyRecord[];
   try {
@@ -279,6 +297,9 @@ export async function authenticateAuthorization(
   const routeClass = routeClassForScope(scope);
   const limit = runtime.rateLimitPerMinute ?? API_KEY_RATE_LIMIT_PER_MINUTE;
   if (!checkRateLimit(matched.id, routeClass, nowSeconds, limit)) {
+    return failure(429, "rate_limited", "Too many requests.");
+  }
+  if (!(await distributedAllow(runtime.distributedRateLimit, "api.key", `key:${matched.id}:${routeClass}`, limit, 60))) {
     return failure(429, "rate_limited", "Too many requests.");
   }
 
@@ -420,6 +441,7 @@ export function liveApiKeyRuntime(): ApiKeyRuntime {
   return {
     nowSeconds: () => Math.floor(Date.now() / 1000),
     pepper,
+    distributedRateLimit: defaultDistributedRateLimiter(),
     async listKeys() {
       const store = await readPayStoreBlob();
       return Object.values(ensureSection(store).keys)
