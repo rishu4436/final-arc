@@ -1,3 +1,4 @@
+import { randomBytes as webhookTestKeyBytes } from "node:crypto";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -36,6 +37,9 @@ import {
   type WebhookDeps,
   type WebhookEndpointRecord,
 } from "./webhooks";
+
+// P3-06: webhook secrets are encrypted at rest; tests use a random per-run key (never a real key).
+process.env.FINAL_WEBHOOK_ENCRYPTION_KEY = webhookTestKeyBytes(32).toString("hex");
 
 const MERCHANT = getAddress("0x00000000000000000000000000000000000000a1");
 const OTHER = getAddress("0x00000000000000000000000000000000000000b2");

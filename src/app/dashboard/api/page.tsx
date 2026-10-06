@@ -103,6 +103,11 @@ export default function DeveloperApiPage() {
           payment state. Residual DNS-rebinding risk on hostname URLs is tracked as P2.
         </p>
         <p className="mt-3 text-sm text-[var(--muted)]">
+          Signing secrets are shown once and stored encrypted (AES-256-GCM). If server-side encryption is not
+          configured, endpoint creation and secret rotation return <span className="mono">503</span> instead of storing a
+          plaintext secret.
+        </p>
+        <p className="mt-3 text-sm text-[var(--muted)]">
           URL rules: absolute https only. No credentials in the URL. Localhost, private IPv4, link-local, and common
           metadata hosts are rejected. Test deliveries use the same rules.
         </p>

@@ -1,4 +1,4 @@
-import type { HttpRequest } from "./http";
+import { pathSegment, type HttpRequest } from "./http";
 import type { CreateEscrowInput, Escrow, EscrowActionInput, EscrowPrepared, EscrowProof } from "./types";
 
 /**
@@ -25,7 +25,7 @@ export class Escrows {
 
   /** Requires escrow:read. */
   async get(escrowId: string): Promise<Escrow> {
-    const body = await this.http.request<{ escrow: Escrow }>("GET", `/api/v1/escrows/${escrowId}`);
+    const body = await this.http.request<{ escrow: Escrow }>("GET", `/api/v1/escrows/${pathSegment(escrowId, "escrowId")}`);
     return body.escrow;
   }
 
@@ -34,7 +34,7 @@ export class Escrows {
    * Reads custody-log checks. A verified funding log is not a paid payment request.
    */
   async proof(escrowId: string): Promise<EscrowProof> {
-    return this.http.request<EscrowProof>("GET", `/api/v1/escrows/${escrowId}/proof`);
+    return this.http.request<EscrowProof>("GET", `/api/v1/escrows/${pathSegment(escrowId, "escrowId")}/proof`);
   }
 
   /**
@@ -42,7 +42,7 @@ export class Escrows {
    * Returns the unsigned open() transaction. Does not submit it and does not mark OPEN.
    */
   async open(escrowId: string): Promise<EscrowPrepared> {
-    return this.http.request<EscrowPrepared>("POST", `/api/v1/escrows/${escrowId}/open`, {});
+    return this.http.request<EscrowPrepared>("POST", `/api/v1/escrows/${pathSegment(escrowId, "escrowId")}/open`, {});
   }
 
   /**
@@ -50,7 +50,7 @@ export class Escrows {
    * Posts a transaction hash. OPEN is returned only when the server verifies EscrowOpened.
    */
   async confirmOpen(escrowId: string, input: { txHash: string }): Promise<Escrow> {
-    const body = await this.http.request<{ escrow: Escrow }>("POST", `/api/v1/escrows/${escrowId}/open`, input);
+    const body = await this.http.request<{ escrow: Escrow }>("POST", `/api/v1/escrows/${pathSegment(escrowId, "escrowId")}/open`, input);
     return body.escrow;
   }
 
@@ -59,45 +59,45 @@ export class Escrows {
    * Returns unsigned exact-amount USDC approve plus fund(). Approval is not funding.
    */
   async prepareFund(escrowId: string): Promise<EscrowPrepared> {
-    return this.http.request<EscrowPrepared>("POST", `/api/v1/escrows/${escrowId}/fund`, {});
+    return this.http.request<EscrowPrepared>("POST", `/api/v1/escrows/${pathSegment(escrowId, "escrowId")}/fund`, {});
   }
 
   /** Requires escrow:write. The server marks FUNDED only when the contract log verifies. */
   async fund(escrowId: string, input: { txHash: string }): Promise<Escrow> {
-    const body = await this.http.request<{ escrow: Escrow }>("POST", `/api/v1/escrows/${escrowId}/fund`, input);
+    const body = await this.http.request<{ escrow: Escrow }>("POST", `/api/v1/escrows/${pathSegment(escrowId, "escrowId")}/fund`, input);
     return body.escrow;
   }
 
   /** Requires escrow:write. Unsigned release calldata. Does not sign and does not mark RELEASED. */
   async prepareRelease(escrowId: string): Promise<EscrowPrepared> {
-    return this.http.request<EscrowPrepared>("POST", `/api/v1/escrows/${escrowId}/release`, {});
+    return this.http.request<EscrowPrepared>("POST", `/api/v1/escrows/${pathSegment(escrowId, "escrowId")}/release`, {});
   }
 
   /** Requires escrow:write. Unsigned refund calldata. Does not sign and does not mark REFUNDED. */
   async prepareRefund(escrowId: string): Promise<EscrowPrepared> {
-    return this.http.request<EscrowPrepared>("POST", `/api/v1/escrows/${escrowId}/refund`, {});
+    return this.http.request<EscrowPrepared>("POST", `/api/v1/escrows/${pathSegment(escrowId, "escrowId")}/refund`, {});
   }
 
   /** Requires escrow:write. Unsigned voidEscrow or cancel calldata. Does not mark CANCELLED. */
   async prepareCancel(escrowId: string): Promise<EscrowPrepared> {
-    return this.http.request<EscrowPrepared>("POST", `/api/v1/escrows/${escrowId}/cancel`, {});
+    return this.http.request<EscrowPrepared>("POST", `/api/v1/escrows/${pathSegment(escrowId, "escrowId")}/cancel`, {});
   }
 
   /** Requires escrow:write plus the recipient's EIP-712 signature. This method does not sign. */
   async release(escrowId: string, input: EscrowActionInput): Promise<Escrow> {
-    const body = await this.http.request<{ escrow: Escrow }>("POST", `/api/v1/escrows/${escrowId}/release`, input);
+    const body = await this.http.request<{ escrow: Escrow }>("POST", `/api/v1/escrows/${pathSegment(escrowId, "escrowId")}/release`, input);
     return body.escrow;
   }
 
   /** Requires escrow:write plus the payer's EIP-712 signature. This method does not sign. */
   async refund(escrowId: string, input: EscrowActionInput): Promise<Escrow> {
-    const body = await this.http.request<{ escrow: Escrow }>("POST", `/api/v1/escrows/${escrowId}/refund`, input);
+    const body = await this.http.request<{ escrow: Escrow }>("POST", `/api/v1/escrows/${pathSegment(escrowId, "escrowId")}/refund`, input);
     return body.escrow;
   }
 
   /** Requires escrow:write plus the creator's EIP-712 signature. No tokens move in cancel. */
   async cancel(escrowId: string, input: EscrowActionInput): Promise<Escrow> {
-    const body = await this.http.request<{ escrow: Escrow }>("POST", `/api/v1/escrows/${escrowId}/cancel`, input);
+    const body = await this.http.request<{ escrow: Escrow }>("POST", `/api/v1/escrows/${pathSegment(escrowId, "escrowId")}/cancel`, input);
     return body.escrow;
   }
 }

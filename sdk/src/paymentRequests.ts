@@ -1,6 +1,6 @@
 import { usdcToBaseUnits } from "./amounts";
 import { FinalConfigurationError } from "./errors";
-import type { HttpRequest } from "./http";
+import { pathSegment, type HttpRequest } from "./http";
 import type {
   CreatePaymentRequestInput,
   CreatePaymentRequestResult,
@@ -63,7 +63,7 @@ export class PaymentRequests {
   async get(requestId: string): Promise<PaymentRequest> {
     return this.http.request<PaymentRequest>(
       "GET",
-      `/api/v1/payment-requests/${encodeURIComponent(requestId)}`,
+      `/api/v1/payment-requests/${pathSegment(requestId, "requestId")}`,
     );
   }
 
@@ -74,7 +74,7 @@ export class PaymentRequests {
   async receipt(requestId: string): Promise<PaymentReceipt> {
     return this.http.request<PaymentReceipt>(
       "GET",
-      `/api/v1/payment-requests/${encodeURIComponent(requestId)}/receipt`,
+      `/api/v1/payment-requests/${pathSegment(requestId, "requestId")}/receipt`,
     );
   }
 }

@@ -99,6 +99,22 @@ Policy denial audit rows are capped at 500 per merchant (oldest dropped on write
 
 On-chain `FinalEscrow.release` may be called only by the stored **recipient**, and only while `block.timestamp < expiresAt`. After expiry, only the **payer** may `refund`. The API records on-chain evidence; it does not move funds itself. No owner/admin release path exists in the contract.
 
+## Webhook secrets at rest (P3-06)
+
+```bash
+FINAL_WEBHOOK_ENCRYPTION_KEY=<32 random bytes as 64 hex chars or base64, set as a Vercel Secret>
+```
+
+- New and rotated webhook signing secrets are stored as AES-256-GCM ciphertext (`enc:v1:…`, random 96-bit IV, GCM tag; additional data binds the value to the endpoint id and merchant). The plaintext secret is returned once on create/rotate and never stored.
+- If the key is missing or malformed, creating an endpoint and rotating a secret **fail closed** with `503 webhook_encryption_unavailable`; no plaintext secret is written.
+- Legacy endpoints that still hold a plaintext secret keep delivering unchanged. They are re-encrypted (same secret value, so merchant verification does not change) the next time the endpoint is updated while the key is configured. Rotating the secret also migrates.
+- A delivery whose stored secret cannot be decrypted (key missing or changed) sends **no** HTTP request and is recorded as retryable `webhook_secret_unavailable`.
+- **Changing the key makes existing encrypted secrets unreadable.** Rotate it only together with rotating every endpoint secret.
+
+## Security headers (P3-05)
+
+Every route sends a Content-Security-Policy (`frame-ancestors 'none'`, `object-src 'none'`, `base-uri 'self'`, `form-action 'self'`, same-origin scripts), `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin` (`no-referrer` on `/p/*` and `/r/*`), `Permissions-Policy`, `Cross-Origin-Opener-Policy`, and HSTS. `script-src` keeps `'unsafe-inline'` because the Next.js App Router bootstrap has no nonce pipeline here; `connect-src` allows `https:`/`wss:` for wallet, chain RPC, and bridge APIs.
+
 ## Cron / webhooks scheduler
 
 Automatic scheduled webhook retries require `CRON_SECRET` and a supported Vercel cron schedule. On Hobby plans without minute cron, the processor endpoint stays fail-closed (`503 cron_not_configured`) until those are configured. See P1-06.

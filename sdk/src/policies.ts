@@ -1,4 +1,4 @@
-import type { HttpRequest } from "./http";
+import { pathSegment, type HttpRequest } from "./http";
 import type { CreatePolicyInput, PaymentPolicy, UpdatePolicyInput } from "./types";
 
 /**
@@ -21,7 +21,7 @@ export class Policies {
 
   /** Requires policies:read. Another merchant's id is not found. */
   async get(id: string): Promise<{ policy: PaymentPolicy }> {
-    return this.http.request<{ policy: PaymentPolicy }>("GET", `/api/v1/policies/${encodeURIComponent(id)}`);
+    return this.http.request<{ policy: PaymentPolicy }>("GET", `/api/v1/policies/${pathSegment(id, "id")}`);
   }
 
   /**
@@ -31,7 +31,7 @@ export class Policies {
   async update(id: string, input: UpdatePolicyInput): Promise<{ policy: PaymentPolicy }> {
     return this.http.request<{ policy: PaymentPolicy }>(
       "PATCH",
-      `/api/v1/policies/${encodeURIComponent(id)}`,
+      `/api/v1/policies/${pathSegment(id, "id")}`,
       input,
     );
   }
@@ -40,7 +40,7 @@ export class Policies {
   async delete(id: string): Promise<{ deleted: true; id: string }> {
     return this.http.request<{ deleted: true; id: string }>(
       "DELETE",
-      `/api/v1/policies/${encodeURIComponent(id)}`,
+      `/api/v1/policies/${pathSegment(id, "id")}`,
     );
   }
 }

@@ -66,7 +66,9 @@ const final = new Final({
 });
 ```
 
-`baseUrl` may point at a staging origin. There is no localhost default. A trailing slash is removed. The client rejects a blank key, a non-http(s) URL, and a URL that embeds credentials.
+`baseUrl` may point at a staging origin. It must use `https:`; plain `http:` is accepted only for exact loopback development hosts (`localhost`, `127.0.0.1`, `[::1]`) so the API key is never sent in cleartext. There is no localhost default. A trailing slash is removed. The client rejects a blank key, a non-https URL, a URL that embeds credentials, and a URL with a query string or fragment. The API key is sent only in the `Authorization` header.
+
+Identifiers passed to methods (escrow, payment request, intent, policy ids, transaction hashes) are encoded as a single path segment; `.`/`..`/empty ids throw `FinalConfigurationError` before any request.
 
 Requests time out with `AbortController`. The timer is cleared when the request finishes. There are **no automatic retries**. `POST /api/v1/payment-requests` is not idempotent in this client, so a timeout or a network error must be handled by your code.
 

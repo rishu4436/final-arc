@@ -6,6 +6,7 @@ import { ARC_CHAIN_ID, arc, arcWalletChain } from "@/lib/arc";
 import { WALLET_ACTIONS, type WalletAction } from "@/lib/apiScopes";
 import { shortAddr } from "@/lib/format";
 import { escrowActionTypedData } from "@/lib/escrowTerms";
+import { escrowFreshness, submittedHashNote } from "@/lib/escrowFreshness";
 import { signedWalletHeaders } from "@/lib/signedWalletHeaders";
 import Link from "next/link";
 import { useState } from "react";
@@ -79,6 +80,7 @@ export function EscrowList() {
   const [rows, setRows] = useState<EscrowJson[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [loadedAt, setLoadedAt] = useState<number | null>(null);
   const ready = mounted && isConnected && typeof address === "string" && isAddress(address);
 
   async function load() {
@@ -98,6 +100,7 @@ export function EscrowList() {
         return;
       }
       setRows(body.escrows ?? []);
+      setLoadedAt(Date.now());
     } catch {
       setError("Escrows could not be loaded.");
     } finally {
@@ -128,6 +131,7 @@ export function EscrowList() {
         {busy ? "Waiting for signature…" : "Load escrows"}
       </button>
       {error ? <p className="mt-4 text-sm text-[var(--stamp)]">{error}</p> : null}
+      {rows ? <p className="mt-4 text-xs text-[var(--muted)]">{escrowFreshness(loadedAt, Date.now(), false).line}</p> : null}
       {rows && rows.length === 0 ? <p className="mt-6 text-sm">No escrows for this wallet.</p> : null}
       <ul className="mt-6 space-y-3">
         {rows?.map((row) => (
@@ -168,6 +172,8 @@ export function EscrowDetail({ escrowId }: { escrowId: string }) {
   const [pendingHash, setPendingHash] = useState<string | null>(null);
   const [pendingNote, setPendingNote] = useState<string | null>(null);
   const [verifyHash, setVerifyHash] = useState("");
+  const [loadedAt, setLoadedAt] = useState<number | null>(null);
+  const [invalidated, setInvalidated] = useState(false);
   const ready = mounted && isConnected && typeof address === "string" && isAddress(address);
   const wallet = ready ? getAddress(address) : null;
 
@@ -189,6 +195,8 @@ export function EscrowDetail({ escrowId }: { escrowId: string }) {
       }
       setRow(body.escrow);
       setDraft(null);
+      setLoadedAt(Date.now());
+      setInvalidated(false);
     } catch {
       setError("Escrow could not be loaded.");
     } finally {
@@ -269,7 +277,7 @@ export function EscrowDetail({ escrowId }: { escrowId: string }) {
       value: 0n,
     });
     setPendingHash(hash);
-    setPendingNote(`${label} submitted. This is not a final escrow state.`);
+    setPendingNote(submittedHashNote(label));
     if (publicClient) await publicClient.waitForTransactionReceipt({ hash });
     return hash;
   }
@@ -295,9 +303,13 @@ export function EscrowDetail({ escrowId }: { escrowId: string }) {
     const { res, body } = await post(path, action, { txHash: hash, ...extra });
     if (!res.ok || !body.escrow) {
       setError(errorText(body));
+      // P3-04: the displayed row may now be behind the server; keep the hash as submitted-only.
+      setInvalidated(true);
       return;
     }
     setRow(body.escrow);
+    setLoadedAt(Date.now());
+    setInvalidated(false);
     setDraft(null);
     setPendingHash(null);
     setPendingNote(null);
@@ -339,6 +351,7 @@ export function EscrowDetail({ escrowId }: { escrowId: string }) {
       }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "The wallet transaction was not submitted.");
+      setInvalidated(true);
     } finally {
       setBusy(false);
     }
@@ -385,7 +398,7 @@ export function EscrowDetail({ escrowId }: { escrowId: string }) {
       {error ? <p className="mt-4 text-sm text-[var(--stamp)]">{error}</p> : null}
       {pendingHash ? (
         <p className="mt-4 text-sm">
-          Submitted{" "}
+          Submitted, unconfirmed{" "}
           <a className="mono text-xs" href={explorerTx(pendingHash)}>
             {shortAddr(pendingHash)}
           </a>
@@ -399,6 +412,9 @@ export function EscrowDetail({ escrowId }: { escrowId: string }) {
             {row.state}
           </p>
           <p>{stateLine(row.state)}</p>
+          <p className={escrowFreshness(loadedAt, Date.now(), invalidated).stale ? "text-[var(--stamp)]" : "text-[var(--muted)]"}>
+            {escrowFreshness(loadedAt, Date.now(), invalidated).line}
+          </p>
           <p className="text-[var(--muted)]">{countdown(row.expiresAt)}</p>
           <p>
             <span className="text-[var(--muted)]">Id </span>

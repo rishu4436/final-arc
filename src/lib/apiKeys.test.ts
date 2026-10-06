@@ -1,3 +1,4 @@
+import { randomBytes as webhookTestKeyBytes } from "node:crypto";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -50,6 +51,9 @@ import {
   updateWebhookEndpoint,
   type WebhookDeps,
 } from "./webhooks";
+
+// P3-06: webhook secrets are encrypted at rest; tests use a random per-run key (never a real key).
+process.env.FINAL_WEBHOOK_ENCRYPTION_KEY = webhookTestKeyBytes(32).toString("hex");
 
 const PEPPER = "phase5-test-pepper";
 const A = privateKeyToAccount("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");

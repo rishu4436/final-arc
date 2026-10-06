@@ -25,6 +25,14 @@ import {
   type EmittableWebhookEvent,
   type WebhookEventType,
 } from "./webhooksCatalog";
+import {
+  WebhookSecretCryptoError,
+  decryptWebhookSecret,
+  encryptWebhookSecret,
+  isEncryptedWebhookSecret,
+  webhookEncryptionKeyFromEnv,
+} from "./webhookSecretCrypto";
+import { parseStrictBoolean } from "./strictBool";
 
 export {
   EMITTABLE_WEBHOOK_EVENTS,
@@ -136,6 +144,11 @@ export type WebhookDeps = {
   caller?: Address;
   /** P2-03: DNS resolution for destination checks. Defaults to dns.lookup. Tests inject stubs. */
   resolveHost?: (hostname: string) => Promise<string[]>;
+  /**
+   * P3-06: AES-256-GCM key for webhook secrets at rest. Defaults to
+   * FINAL_WEBHOOK_ENCRYPTION_KEY. Null means new secrets cannot be stored (fail closed).
+   */
+  encryptionKey?: () => Buffer | null;
 };
 
 export const WEBHOOK_ERROR_CODES = {
@@ -147,7 +160,34 @@ export const WEBHOOK_ERROR_CODES = {
   storeUnavailable: "store_unavailable",
   invalidRequest: "invalid_request",
   internal: "internal",
+  encryptionUnavailable: "webhook_encryption_unavailable",
 } as const;
+
+function encryptionKeyOf(deps: WebhookDeps): Buffer | null {
+  return (deps.encryptionKey ?? webhookEncryptionKeyFromEnv)();
+}
+
+/** P3-06: encrypt a freshly generated secret before it touches the store. */
+function sealSecret(plaintext: string, endpointId: string, merchant: string, deps: WebhookDeps): string {
+  try {
+    return encryptWebhookSecret(plaintext, { endpointId, merchant }, encryptionKeyOf(deps));
+  } catch {
+    throw new WebhookHttpError(
+      503,
+      WEBHOOK_ERROR_CODES.encryptionUnavailable,
+      "Webhook secret encryption is not configured. No secret was stored.",
+    );
+  }
+}
+
+/** P3-03: `enabled` must be a real boolean (or the literal strings "true"/"false"). */
+function parseEnabledInput(value: unknown): boolean {
+  const parsed = parseStrictBoolean(value);
+  if (parsed === null) {
+    throw new WebhookValidationError(WEBHOOK_ERROR_CODES.invalidRequest, "enabled must be true or false.");
+  }
+  return parsed;
+}
 
 function emptySection(): WebhookStoreSection {
   return { endpoints: {}, deliveries: {} };
@@ -511,6 +551,19 @@ function notFound(): WebhookApiError {
 }
 
 /**
+ * P3-06 lazy migration: a legacy plaintext secret is re-encrypted (same secret value, so
+ * merchant verification is unchanged) when the endpoint is updated and a key is configured.
+ */
+function migrateLegacySecret(current: WebhookEndpointRecord, key: Buffer | null): string {
+  if (isEncryptedWebhookSecret(current.secret) || !key) return current.secret;
+  try {
+    return encryptWebhookSecret(current.secret, { endpointId: current.id, merchant: current.merchant }, key);
+  } catch {
+    return current.secret;
+  }
+}
+
+/**
  * Merchant comes from the authenticated caller. A client-supplied merchant that
  * does not match is never used as authority.
  */
@@ -541,15 +594,18 @@ export async function createWebhookEndpoint(
     }
     const url = validateWebhookUrl(input.url);
     const events = parseEventSubscriptions(input.events);
-    const enabled = input.enabled === undefined ? true : Boolean(input.enabled);
+    const enabled = input.enabled === undefined ? true : parseEnabledInput(input.enabled);
     const now = new Date(deps.nowSeconds() * 1000).toISOString();
+    const id = deps.randomId("wh");
+    const plaintextSecret = deps.createSecret();
+    // P3-06: only ciphertext is persisted. Missing key fails closed before any write.
     const row: WebhookEndpointRecord = {
-      id: deps.randomId("wh"),
+      id,
       merchant,
       url,
       enabled,
       events,
-      secret: deps.createSecret(),
+      secret: sealSecret(plaintextSecret, id, merchant, deps),
       createdAt: now,
       updatedAt: now,
     };
@@ -563,7 +619,7 @@ export async function createWebhookEndpoint(
       }
       section(store).endpoints[row.id] = row;
     });
-    return { status: 200, body: { ...toPublicEndpoint(row), secret: row.secret } };
+    return { status: 200, body: { ...toPublicEndpoint(row), secret: plaintextSecret } };
   } catch (err) {
     return asWebhookError(err);
   }
@@ -620,7 +676,10 @@ export async function updateWebhookEndpoint(
     let nextEvents: WebhookEndpointRecord["events"] | undefined;
     if (input.events !== undefined) nextEvents = parseEventSubscriptions(input.events);
     const rotate = input.rotateSecret === true;
+    const nextEnabled = input.enabled === undefined ? undefined : parseEnabledInput(input.enabled);
     const rotatedSecret = rotate ? deps.createSecret() : null;
+    const sealedRotated = rotatedSecret ? sealSecret(rotatedSecret, id, merchant, deps) : null;
+    const migrationKey = encryptionKeyOf(deps);
     let updated: WebhookEndpointRecord | null = null;
     await mutatePayStoreBlob((store) => {
       const current = asEndpoint(section(store).endpoints[id]);
@@ -632,8 +691,8 @@ export async function updateWebhookEndpoint(
         ...current,
         url: nextUrl ?? current.url,
         events: nextEvents ?? current.events,
-        enabled: input.enabled === undefined ? current.enabled : Boolean(input.enabled),
-        secret: rotatedSecret ?? current.secret,
+        enabled: nextEnabled ?? current.enabled,
+        secret: sealedRotated ?? migrateLegacySecret(current, migrationKey),
         updatedAt: new Date(deps.nowSeconds() * 1000).toISOString(),
       };
       section(store).endpoints[id] = updated;
@@ -907,7 +966,21 @@ async function httpDeliver(
   deps: WebhookDeps,
 ): Promise<{ httpStatus: number | null; error: string | null; networkError: boolean }> {
   const timestamp = deps.nowSeconds();
-  const signature = signWebhookBody(endpoint.secret, timestamp, rawBody);
+  let signingSecret: string;
+  try {
+    signingSecret = decryptWebhookSecret(
+      endpoint.secret,
+      { endpointId: endpoint.id, merchant: endpoint.merchant },
+      encryptionKeyOf(deps),
+    );
+  } catch (err) {
+    // P3-06: no HTTP without a usable secret. Retryable so restoring the key recovers.
+    if (err instanceof WebhookSecretCryptoError) {
+      return { httpStatus: null, error: "webhook_secret_unavailable", networkError: true };
+    }
+    throw err;
+  }
+  const signature = signWebhookBody(signingSecret, timestamp, rawBody);
   try {
     await assertSafeWebhookDestination(endpoint.url, deps.resolveHost ?? defaultResolveHost);
     const res = await deps.fetch(endpoint.url, {

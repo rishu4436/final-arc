@@ -1,4 +1,4 @@
-import type { HttpRequest } from "./http";
+import { pathSegment, type HttpRequest } from "./http";
 import type { TransactionVerification } from "./types";
 
 export class TransactionVerificationClient {
@@ -11,7 +11,7 @@ export class TransactionVerificationClient {
   async transaction(txHash: string): Promise<TransactionVerification> {
     return this.http.request<TransactionVerification>(
       "GET",
-      `/api/v1/verify/${encodeURIComponent(txHash)}`,
+      `/api/v1/verify/${pathSegment(txHash, "txHash")}`,
     );
   }
 }

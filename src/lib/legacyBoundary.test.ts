@@ -1,3 +1,4 @@
+import { randomBytes as webhookTestKeyBytes } from "node:crypto";
 /**
  * Phase 13 — Batch 0 + Batch 1 regression tests.
  * P1-01 API-key pepper fail-closed, P1-03 legacy record injection,
@@ -53,6 +54,9 @@ import {
   validateWebhookUrl,
   verifyWebhookSignature,
 } from "./webhooks";
+
+// P3-06: webhook secrets are encrypted at rest; tests use a random per-run key (never a real key).
+process.env.FINAL_WEBHOOK_ENCRYPTION_KEY = webhookTestKeyBytes(32).toString("hex");
 
 const KEY_A = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80" as const;
 const KEY_B = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d" as const;

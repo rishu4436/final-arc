@@ -1,5 +1,5 @@
 import { FinalConfigurationError } from "./errors";
-import type { HttpRequest } from "./http";
+import { pathSegment, type HttpRequest } from "./http";
 import type { AgentIdempotency, AgentPaymentIntent, CreateAgentPaymentIntentInput } from "./types";
 
 /**
@@ -22,7 +22,7 @@ export class AgentPaymentIntents {
   async get(intentId: string): Promise<AgentPaymentIntent> {
     return this.http.request<AgentPaymentIntent>(
       "GET",
-      `/api/v1/agent/payment-intents/${encodeURIComponent(intentId)}`,
+      `/api/v1/agent/payment-intents/${pathSegment(intentId, "intentId")}`,
     );
   }
 
@@ -38,7 +38,7 @@ export class AgentPaymentIntents {
     const key = requireIdempotencyKey(options);
     return this.http.request<AgentPaymentIntent>(
       "POST",
-      `/api/v1/agent/payment-intents/${encodeURIComponent(intentId)}/submit`,
+      `/api/v1/agent/payment-intents/${pathSegment(intentId, "intentId")}/submit`,
       input,
       { "idempotency-key": key },
     );
@@ -48,7 +48,7 @@ export class AgentPaymentIntents {
   async result(intentId: string): Promise<AgentPaymentIntent> {
     return this.http.request<AgentPaymentIntent>(
       "GET",
-      `/api/v1/agent/payment-intents/${encodeURIComponent(intentId)}/result`,
+      `/api/v1/agent/payment-intents/${pathSegment(intentId, "intentId")}/result`,
     );
   }
 }

@@ -27,10 +27,18 @@ export function resolveClientConfig(options: {
     throw new FinalConfigurationError("baseUrl is invalid.");
   }
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-    throw new FinalConfigurationError("baseUrl must use http or https.");
+    throw new FinalConfigurationError("baseUrl must use https.");
   }
   if (parsed.username.length > 0 || parsed.password.length > 0) {
     throw new FinalConfigurationError("baseUrl must not contain credentials.");
+  }
+  // Phase 13 (P3-01): the API key is a bearer secret. Plain http is accepted only for
+  // loopback development hosts; every other http origin is rejected.
+  if (parsed.protocol === "http:" && !isLoopbackHost(parsed.hostname)) {
+    throw new FinalConfigurationError("baseUrl must use https (http is allowed only for localhost, 127.0.0.1, or [::1]).");
+  }
+  if (parsed.search.length > 0 || parsed.hash.length > 0) {
+    throw new FinalConfigurationError("baseUrl must not contain a query string or fragment.");
   }
   const timeoutMs = options.timeoutMs === undefined ? DEFAULT_TIMEOUT_MS : options.timeoutMs;
   if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
@@ -38,6 +46,27 @@ export function resolveClientConfig(options: {
   }
   const baseUrl = parsed.toString().replace(/\/+$/, "");
   return { apiKey: options.apiKey, baseUrl, timeoutMs };
+}
+
+/** Exact loopback hostnames only. WHATWG URL already normalizes IPv4/IPv6 encodings. */
+export function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  return host === "localhost" || host === "127.0.0.1" || host === "[::1]";
+}
+
+/**
+ * Phase 13 (P3-02): encode one caller-supplied identifier as a single URL path segment.
+ * Rejects empty, ".", "..", and non-string values so an id can never escape its route
+ * (encodeURIComponent leaves "." and ".." intact, and URL parsing would resolve them).
+ */
+export function pathSegment(value: unknown, label = "id"): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 256) {
+    throw new FinalConfigurationError(`${label} must be a non-empty string.`);
+  }
+  if (value === "." || value === "..") {
+    throw new FinalConfigurationError(`${label} is invalid.`);
+  }
+  return encodeURIComponent(value);
 }
 
 type ErrorEnvelope = {
